@@ -146,8 +146,8 @@ Agents drift toward attack classes they've already found success in. A hunter th
 ## Attribution
 
 - **Cloudflare Project Glasswing** — harness architecture (recon → hunt → validate → gapfill → trace → feedback)
-- **Trail of Bits** — code review methodology adapted into attack patterns
-- **WooYun** — 88,636 real vulnerability cases from China's bug bounty history (2010–2016)
+- **Trail of Bits** — code review methodology adapted into the 44 attack patterns
+- **WooYun** — 88,636 real vulnerability cases from [tanweai/wooyun-legacy](https://github.com/tanweai/wooyun-legacy). The sql-injection pattern is supplemented with bypass techniques from this knowledge base.
 - **DataDog GuardDog** — supply chain behavior analysis methodology (arXiv 2603.27549)
 - **NodeSecure** — AST-level JavaScript analysis methodology
 - **OSV** — Open Source Vulnerabilities database (Google/OpenSSF)
