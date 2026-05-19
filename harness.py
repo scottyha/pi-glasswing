@@ -34,9 +34,9 @@ from pathlib import Path
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-SKILL_DIR = Path(__file__).parent / "skill"
-WOOYUN_DIR = Path(__file__).parent / "wooyun-categories"
-RESULTS_DIR = Path(__file__).parent / "results"
+SKILL_DIR = Path(__file__).resolve().parent / "skill"
+WOOYUN_DIR = Path(__file__).resolve().parent / "wooyun-categories"
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 BATCH_SIZE = 8          # concurrent pi sessions
 PI_TIMEOUT = 600        # seconds per session (10 min)
@@ -747,7 +747,7 @@ def stage_dedupe(hunt_results: list[dict], validate_results: list[dict]) -> list
     return deduped
 
 
-def stage_report(deduped_findings: list[dict], repo_path: str):
+def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str = None):
     """Phase 5: Generate structured report."""
     
     print("\n═══ STAGE 5: REPORT ═══")
@@ -793,7 +793,71 @@ def stage_report(deduped_findings: list[dict], repo_path: str):
         if count:
             md_lines.append(f"- **{sev}:** {count}")
     
-    md_lines.extend(["", "## Findings", ""])
+    # Live intel section — known CVEs in dependencies found during harvest
+    if live_context:
+        md_lines.append("")
+        md_lines.append("## Known Vulnerabilities in Dependencies")
+        md_lines.append("")
+        md_lines.append("*Discovered during intel harvest phase (OSV, NVD, npm audit). "
+                        "These are known CVEs affecting the codebase's dependencies. "
+                        "Hunters were aware of these during analysis.*")
+        md_lines.append("")
+        
+        # Extract key sections from the live context brief
+        in_section = False
+        section_name = ""
+        for line in live_context.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("## ") and "Hunter Guidance" not in stripped and "Target Dependencies" not in stripped and "OpenSSF Scorecard" not in stripped:
+                in_section = True
+                # Rewrite heading levels for nesting in the report
+                md_lines.append(f"### {stripped.lstrip('# ')}")
+                md_lines.append("")
+                continue
+            elif stripped.startswith("## "):
+                in_section = False
+                continue
+            elif stripped.startswith("# ") and "Live Vulnerability" in stripped:
+                continue  # skip title
+            
+            if in_section and stripped:
+                # Add blank line after headings only, not after every line
+                if stripped.startswith("#") or stripped.startswith("- ") or stripped.startswith("**"):
+                    md_lines.append(stripped)
+                else:
+                    md_lines.append(stripped)
+        
+        # Add to JSON report too
+        # Extract CVE counts from intel text
+        intel_summary = {}
+        for line in live_context.split("\n"):
+            stripped = line.strip()
+            if "Known Vulnerabilities in Dependencies" in stripped:
+                match = re.search(r'Known Vulnerabilities in Dependencies[^(]*\((\d+)\)', stripped)
+                if match:
+                    intel_summary["osv_count"] = int(match.group(1))
+            if stripped.startswith("## npm Registry Advisories"):
+                match = re.search(r'npm Registry Advisories[^(]*\((\d+)\)', stripped)
+                if match:
+                    intel_summary["npm_advisory_count"] = int(match.group(1))
+            if stripped.startswith("## Actively Exploited") and "KEV" in stripped:
+                match = re.search(r'Actively Exploited[^(]*\((\d+)\)', stripped)
+                if match:
+                    intel_summary["cisa_kev_total"] = int(match.group(1))
+            if "(" in stripped and ")" in stripped and any(c.isdigit() for c in stripped.split("(")[1]):
+                if "CRITICAL" in stripped:
+                    match = re.search(r'CRITICAL\s+\((\d+)\)', stripped)
+                    if match:
+                        intel_summary["critical_cves"] = int(match.group(1))
+                if "HIGH" in stripped:
+                    match = re.search(r'HIGH\s+\((\d+)\)', stripped)
+                    if match:
+                        intel_summary["high_cves"] = int(match.group(1))
+        report["intel_summary"] = intel_summary
+        md_lines.append("")
+    
+    md_lines.append("## Findings")
+    md_lines.append("")
     
     sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     for f in sorted(deduped_findings, key=lambda x: sev_order.get(x.get("severity", "LOW"), 99)):
@@ -1086,7 +1150,7 @@ def main():
     deduped = stage_dedupe(hunt_results, validate_results)
     
     # Stage 6: Report
-    stage_report(deduped, repo_path)
+    stage_report(deduped, repo_path, live_context=live_context)
     
     total = len(deduped)
     critical = sum(1 for f in deduped if f.get("severity") == "CRITICAL")
