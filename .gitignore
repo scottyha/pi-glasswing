@@ -1,0 +1,34 @@
+# Output
+results/
+*.report.json
+*.report.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
+
+# WooYun knowledge files (copied from external source — 74MB)
+wooyun-categories/
+
+# Secrets
+.env
+.env.local
+*.env
+
+# OS artifacts
+nsecure-result.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ruff
+.ruff_cache/
