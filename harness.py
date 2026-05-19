@@ -34,9 +34,9 @@ from pathlib import Path
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-SKILL_DIR = Path.home() / ".pi/agent/skills/web-vuln-audit"
-WOOYUN_DIR = Path.home() / "projects/pi-glasswing/wooyun-categories"
-RESULTS_DIR = Path.home() / "projects/pi-glasswing/results"
+SKILL_DIR = Path(__file__).parent / "skill"
+WOOYUN_DIR = Path(__file__).parent / "wooyun-categories"
+RESULTS_DIR = Path(__file__).parent / "results"
 
 BATCH_SIZE = 8          # concurrent pi sessions
 PI_TIMEOUT = 600        # seconds per session (10 min)

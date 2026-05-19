@@ -9,8 +9,8 @@ __pycache__/
 *.pyo
 .ruff_cache/
 
-# WooYun knowledge files (copied from external source — 74MB)
-wooyun-categories/
+# WooYun knowledge files (MIT-licensed, from tanweai/wooyun-legacy)
+# wooyun-categories/
 
 # Secrets
 .env

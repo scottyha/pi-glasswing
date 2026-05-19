@@ -55,8 +55,8 @@ python3 vulnerability_context.py /path/to/target-repo
 
 - **pi** (≥0.74) — the coding agent CLI. [Install](https://github.com/earendil-works/pi-coding-agent)
 - **Python** ≥3.10 with `requests`
-- **web-vuln-audit skill** — 44 attack patterns at `~/.pi/agent/skills/web-vuln-audit/`
-- **WooYun knowledge base** (optional) — 86MB of real-world bypass techniques at `~/projects/pi-glasswing/wooyun-categories/`. Download from [scottyha/wooyun-legacy](https://github.com/tanweai/wooyun-legacy) or skip — the harness degrades gracefully.
+- **Attack patterns** — 44 patterns at `./skill/patterns-*.md`
+- **WooYun knowledge base** (optional) — 86MB of real-world bypass techniques at `./wooyun-categories/`. From [tanweai/wooyun-legacy](https://github.com/tanweai/wooyun-legacy) (MIT). Skip or delete — harness degrades gracefully.
 
 ## Attack Patterns (44)
 
@@ -110,11 +110,17 @@ All free, no signup required:
 ~/projects/pi-glasswing/
 ├── harness.py                   ← main pipeline orchestrator
 ├── vulnerability_context.py     ← live intel harvester
-├── requirements.txt             ← Python dependencies
+├── skill/                       ← 44 attack patterns (patterns-*.md)
+│   ├── patterns-nextjs.md
+│   ├── patterns-postgres.md
+│   ├── patterns-chat-agent.md
+│   ├── patterns-infra.md
+│   └── ...
+├── wooyun-categories/           ← bypass techniques from WooYun (MIT)
+├── requirements.txt
 ├── .gitignore
 ├── LICENSE
 ├── README.md
-├── wooyun-categories/           ← (optional) bypass techniques from WooYun
 └── results/                     ← output directory (gitignored)
 ```
 
