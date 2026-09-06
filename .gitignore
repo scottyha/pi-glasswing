@@ -32,3 +32,5 @@ Thumbs.db
 
 # Ruff
 .ruff_cache/
+AGENTS.md
+**/AGENTS.md
