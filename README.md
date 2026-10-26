@@ -64,7 +64,7 @@ python3 vulnerability_context.py /path/to/target-repo
 `missing-auth`, `middleware-bypass`, `server-component-leak`, `client-secrets`, `fail-open-defaults`, `unvalidated-server-action`, `server-action-no-auth`, `error-state-leak`, `debug-in-prod`, `path-traversal`, `open-redirect`, `ssrf-image-loader`
 
 ### PostgreSQL (11)
-`sql-injection` 📚WooYun, `dynamic-table-names`, `over-privileged-db-user`, `connection-string-leak`, `embedding-manipulation`, `vector-query-injection`, `unclosed-connections`, `select-star-leak`, `missing-rls`, `race-condition-leads`
+`sql-injection` 📚WooYun, `dynamic-table-names`, `over-privileged-db-user`, `connection-string-leak`, `embedding-manipulation`, `vector-query-injection`, `unclosed-connections`, `select-star-leak`, `missing-rls`, `race-condition-leads`, `etl-sql-assembly`
 
 ### LLM Chat Agent (10)
 `prompt-extraction`, `indirect-prompt-injection`, `multi-turn-injection`, `data-injection`, `unauthorized-function-call`, `llm-as-oracle`, `response-leakage`, `expensive-vector-abuse`, `context-exhaustion`, `unsanitised-input`
