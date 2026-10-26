@@ -367,7 +367,8 @@ against the codebase's actual dependency versions.
 
 
 def stage_hunt(repo_path: str, recon_doc: str, patterns: list[str] = None, 
-               batch_size: int = BATCH_SIZE, live_context: str = "") -> list[dict]:
+               batch_size: int = BATCH_SIZE, live_context: str = "",
+               accounting: dict = None) -> list[dict]:
     """Phase 2: Fan out parallel hunt agents, one per attack pattern."""
     
     # Determine which patterns to run
@@ -454,17 +455,38 @@ def stage_hunt(repo_path: str, recon_doc: str, patterns: list[str] = None,
         
         all_findings.append(entry)
     
-    # Save raw hunt results
+    # Stable ids before anything downstream joins on them
+    assigned = _ensure_finding_ids(all_findings)
+    if assigned:
+        print(f"  ⚠ {assigned} finding(s) had a missing or duplicate id — reassigned")
+
+    # Save raw hunt results (re-saved after gapfill, so the artefact matches the
+    # report's funnel instead of silently omitting gapfill findings)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     hunt_path = RESULTS_DIR / f"hunt-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
     hunt_path.write_text(json.dumps(all_findings, indent=2))
     print(f"\n  ✓ Hunt results saved to {hunt_path}")
-    
+
+    if accounting is not None:
+        accounting["hunt_artifact"] = str(hunt_path)
+        accounting["patterns_planned"] = len(pattern_ids)
+        accounting["hunt_emitted"] = sum(len(r.get("findings", [])) for r in all_findings)
+        accounting["hunt_failed"] = [
+            {"pattern_id": r["pattern_id"], "error": r.get("error")}
+            for r in all_findings
+            if r.get("error")
+        ]
+        if accounting["hunt_failed"]:
+            print(f"  ⚠ {len(accounting['hunt_failed'])} pattern(s) produced NO hunt result "
+                  f"(coverage gap, not 'clean'): "
+                  f"{', '.join(f['pattern_id'] for f in accounting['hunt_failed'])}")
+
     return all_findings
 
 
 def stage_gapfill(repo_path: str, recon_doc: str, hunt_results: list[dict],
-                  live_context: str = "", batch_size: int = BATCH_SIZE) -> list[dict]:
+                  live_context: str = "", batch_size: int = BATCH_SIZE,
+                  accounting: dict = None) -> list[dict]:
     """Phase 2.5: Gapfill — re-queue patterns that returned zero findings
     but have relevant coverage in the recon doc's notable findings.
     
@@ -472,7 +494,15 @@ def stage_gapfill(repo_path: str, recon_doc: str, hunt_results: list[dict],
     had success with, leaving other patterns poorly covered. This stage performs
     a second pass with narrowed scope for empty patterns.
     """
-    # Find patterns with zero findings
+    if accounting is not None:
+        accounting.setdefault("gapfill_emitted", 0)
+        accounting["gapfill_requeued"] = []
+
+    # Find patterns with zero findings.
+    # NOTE: patterns whose hunt errored or timed out are excluded here on
+    # purpose. They are recorded in the funnel as `hunt_failed` and reported as a
+    # coverage gap, but re-queueing them doubles the hunter spend on a pattern
+    # that already consumed its budget — that is a spend decision, not a fix.
     empty_patterns = [r for r in hunt_results if not r.get("findings") and not r.get("error")]
     if not empty_patterns:
         print("\n═══ STAGE 2.5: GAPFILL — No empty patterns to re-queue ═══")
@@ -493,6 +523,8 @@ def stage_gapfill(repo_path: str, recon_doc: str, hunt_results: list[dict],
         return hunt_results
     
     print(f"\n═══ STAGE 2.5: GAPFILL — {len(patterns_to_requeue)} patterns with recon clues ═══")
+    if accounting is not None:
+        accounting["gapfill_requeued"] = list(patterns_to_requeue)
     for pid in patterns_to_requeue:
         print(f"  → Re-queuing {pid} ({PATTERNS[pid]['name']})")
     
@@ -556,13 +588,19 @@ def stage_gapfill(repo_path: str, recon_doc: str, hunt_results: list[dict],
                     findings = parse_findings(result["output"], pid)
                     if findings:
                         hr["findings"].extend(findings)
+                        if accounting is not None:
+                            accounting["gapfill_emitted"] += len(findings)
                         print(f"    🎯 Gapfill found {len(findings)} more for {pid}")
                     else:
                         print(f"    ✓ Gapfill confirmed: nothing in {pid}")
                 else:
                     print(f"    ⚠ Gapfill failed for {pid}: {result.get('error', 'unknown')}")
                 break
-    
+
+    _ensure_finding_ids(hunt_results)
+    if accounting is not None and accounting.get("hunt_artifact"):
+        Path(accounting["hunt_artifact"]).write_text(json.dumps(hunt_results, indent=2))
+
     return hunt_results
 
 
@@ -646,20 +684,140 @@ def _map_recon_to_patterns(empty_patterns: list[dict], notable_section: str) -> 
     return result
 
 
+def _normalise_sink(sink: str) -> str:
+    """Whitespace/case-normalised sink text, capped for key stability."""
+    return re.sub(r"\s+", " ", sink or "").strip().lower()[:200]
+
+
+def _root_cause_key(finding: dict) -> str:
+    """Dedupe key: the same vulnerability pattern landing in the same sink.
+
+    Deliberately conservative. It does NOT group by file: two findings of the
+    same pattern in one file are routinely different defects (an unauthenticated
+    login form and an authenticated chat endpoint both "missing rate limiting"),
+    and merging those would hide a real finding behind a variants list. Anything
+    that is not provably the same sink stays its own row.
+    """
+    pattern = finding.get("pattern", "unknown")
+    sink = _normalise_sink(finding.get("sink"))
+    if sink:
+        return f"{pattern}::{sink}"
+    location = re.sub(r"\s+", " ", finding.get("location") or "unknown").strip().lower()
+    return f"{pattern}::location::{location}"
+
+
+def _ensure_finding_ids(hunt_results: list[dict]) -> int:
+    """Give every finding a stable, unique id.
+
+    Validation verdicts are joined back to findings by id. A missing or
+    duplicated id silently drops the wrong finding (a rejected one survives, or
+    an upheld one disappears) — which is exactly the class of loss this harness
+    is supposed to make impossible. Returns the number of ids (re)assigned.
+    """
+    seen = set()
+    assigned = 0
+    for pattern_result in hunt_results:
+        pattern_id = pattern_result.get("pattern_id", "unknown")
+        for index, finding in enumerate(pattern_result.get("findings", []), start=1):
+            fid = finding.get("id")
+            if not fid or fid in seen:
+                candidate = f"F-{pattern_id}-{index:03d}"
+                suffix = 1
+                while candidate in seen:
+                    suffix += 1
+                    candidate = f"F-{pattern_id}-{index:03d}-{suffix}"
+                finding["id"] = candidate
+                fid = candidate
+                assigned += 1
+            seen.add(fid)
+    return assigned
+
+
+def reconcile_funnel(accounting: dict) -> list[str]:
+    """Stage-to-stage count reconciliation. Returns a list of mismatches.
+
+    An accounting dict missing the keys that carry the counts is itself a
+    mismatch: a vacuous pass would make "reconciles: true" meaningless.
+    """
+    required = (
+        "hunt_emitted", "sent_to_validate", "verdicts",
+        "carried_forward", "reported", "collapsed_into_variants",
+    )
+    missing = [key for key in required if key not in accounting]
+    if missing:
+        return [f"funnel accounting incomplete — missing {', '.join(missing)}"]
+
+    problems = []
+    emitted = accounting.get("hunt_emitted", 0) + accounting.get("gapfill_emitted", 0)
+    excluded = len(accounting.get("excluded_by_confidence", []))
+    sent = accounting.get("sent_to_validate", 0)
+    if emitted != sent + excluded:
+        problems.append(
+            f"hunt {accounting.get('hunt_emitted', 0)} + gapfill "
+            f"{accounting.get('gapfill_emitted', 0)} = {emitted} "
+            f"!= validated {sent} + excluded-by-confidence {excluded}"
+        )
+
+    verdicts = accounting.get("verdicts", {})
+    verdict_total = sum(verdicts.values())
+    if verdict_total != sent:
+        problems.append(f"verdicts {verdict_total} != findings sent to validation {sent}")
+
+    carried = accounting.get("carried_forward", 0)
+    if carried != verdicts.get("upheld", 0) + verdicts.get("unvalidated", 0):
+        problems.append(
+            f"carried forward {carried} != upheld {verdicts.get('upheld', 0)} "
+            f"+ unvalidated {verdicts.get('unvalidated', 0)}"
+        )
+
+    reported = accounting.get("reported", 0)
+    collapsed = accounting.get("collapsed_into_variants", 0)
+    if carried != reported + collapsed:
+        problems.append(f"carried forward {carried} != reported {reported} + collapsed {collapsed}")
+
+    expected_reported = accounting.get("expected_reported")
+    if expected_reported is not None and reported != expected_reported:
+        problems.append(f"reported {reported} != rows actually in the report {expected_reported}")
+
+    return problems
+
+
 def stage_validate(repo_path: str, recon_doc: str, hunt_results: list[dict], 
-                   batch_size: int = BATCH_SIZE) -> list[dict]:
+                   batch_size: int = BATCH_SIZE, accounting: dict = None) -> list[dict]:
     """Phase 3: Adversarial validation — fresh agents try to DISPROVE each finding."""
     
-    # Collect all findings that need validation
+    # Collect all findings that need validation. Anything that fails the
+    # confidence gate is recorded, not silently dropped — an unannounced
+    # disappearance is what makes a report unciteable.
     findings_to_validate = []
+    excluded = []
     for pattern_result in hunt_results:
         for finding in pattern_result.get("findings", []):
-            if finding.get("confidence") in ("CONFIRMED", "SUSPECTED"):
+            confidence = finding.get("confidence")
+            if confidence in ("CONFIRMED", "SUSPECTED"):
                 findings_to_validate.append({
                     "pattern_id": pattern_result["pattern_id"],
                     "finding": finding,
                 })
-    
+            else:
+                excluded.append({
+                    "id": finding.get("id") or "unknown",
+                    "pattern_id": pattern_result["pattern_id"],
+                    "confidence": confidence or "missing",
+                    "severity": finding.get("severity"),
+                    "reason": "confidence gate (only CONFIRMED/SUSPECTED are adversarially validated)",
+                })
+
+    if accounting is not None:
+        accounting["excluded_by_confidence"] = excluded
+        accounting["sent_to_validate"] = len(findings_to_validate)
+        accounting["verdicts"] = {"upheld": 0, "rejected": 0, "unvalidated": 0}
+
+    if excluded:
+        print(f"  ⤵ {len(excluded)} finding(s) excluded BEFORE validation "
+              f"(not validated — listed in the report): "
+              f"{', '.join(e['id'] for e in excluded)}")
+
     if not findings_to_validate:
         print("\n═══ STAGE 3: VALIDATE — No findings to validate ═══")
         return []
@@ -675,7 +833,7 @@ def stage_validate(repo_path: str, recon_doc: str, hunt_results: list[dict],
         )
         validate_items.append({
             "pattern_id": item["pattern_id"],
-            "finding_id": item["finding"].get("id", "unknown"),
+            "finding_id": item["finding"].get("id") or "unknown",
             "prompt": prompt,
             "repo": repo_path,
         })
@@ -697,11 +855,24 @@ def stage_validate(repo_path: str, recon_doc: str, hunt_results: list[dict],
                 "reasoning": f"validation failed: {result.get('error', 'unknown')}",
             }
             print(f"    ⚠ UNVALIDATED: {result['finding_id']} — {result.get('error', 'unknown')}")
-    
+
+    if accounting is not None:
+        verdicts = {"upheld": 0, "rejected": 0, "unvalidated": 0}
+        for result in validate_results:
+            verdict = result.get("verdict", {})
+            if verdict.get("failed"):
+                verdicts["unvalidated"] += 1
+            elif verdict.get("rejected"):
+                verdicts["rejected"] += 1
+            else:
+                verdicts["upheld"] += 1
+        accounting["verdicts"] = verdicts
+
     return validate_results
 
 
-def stage_dedupe(hunt_results: list[dict], validate_results: list[dict]) -> list[dict]:
+def stage_dedupe(hunt_results: list[dict], validate_results: list[dict],
+                 accounting: dict = None) -> list[dict]:
     """Phase 4: Deduplicate findings by root cause. Collapse variants."""
     
     print("\n═══ STAGE 4: DEDUPE + VARIANT ANALYSIS ═══")
@@ -720,10 +891,18 @@ def stage_dedupe(hunt_results: list[dict], validate_results: list[dict]) -> list
     
     # Collect upheld findings
     upheld = []
+    rejected_findings = []
     for pattern_result in hunt_results:
         for finding in pattern_result.get("findings", []):
-            fid = finding.get("id", "")
+            fid = finding.get("id") or "unknown"
             if fid in rejected_ids:
+                # Disproved, but still accounted for: an unexplained absence is
+                # indistinguishable from a finding that never existed.
+                rejected_findings.append({
+                    "id": fid,
+                    "pattern_id": pattern_result["pattern_id"],
+                    "severity": finding.get("severity"),
+                })
                 continue
             if finding.get("confidence") in ("CONFIRMED", "SUSPECTED"):
                 unvalidated = fid in unvalidated_ids
@@ -734,38 +913,80 @@ def stage_dedupe(hunt_results: list[dict], validate_results: list[dict]) -> list
                     "validation_state": "unvalidated" if unvalidated else "validated",
                 })
     
-    # Group by root cause (same file + same vulnerability class)
+    # Group by root cause (same vulnerability pattern, same sink)
     groups = {}
     for f in upheld:
-        location = f.get("location", "unknown")
-        vuln_class = f.get("pattern", "unknown")
-        key = f"{location}::{vuln_class}"
-        if key not in groups:
-            groups[key] = []
-        groups[key].append(f)
+        groups.setdefault(_root_cause_key(f), []).append(f)
     
     # Collapse: each group → one primary + variants
     deduped = []
+    collapsed = 0
     severity_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
     for key, group in groups.items():
-        primary = max(group, key=lambda f: severity_rank.get(f.get("severity", "LOW"), 1))
+        # Severity first, then a finding the validator actually adjudicated,
+        # then hunter confidence — a timed-out finding must never represent a
+        # group that also contains an upheld one.
+        primary = max(group, key=lambda f: (
+            severity_rank.get(f.get("severity", "LOW"), 1),
+            1 if f.get("validated") else 0,
+            1 if f.get("confidence") == "CONFIRMED" else 0,
+        ))
         variants = [f for f in group if f is not primary]
+        collapsed += len(variants)
         deduped.append({
             **primary,
-            "variants": [v.get("id") for v in variants],
-            "is_root_cause": True,
+            "variants": [str(v.get("id") or "unknown") for v in variants],
+            # Collapsing rows must not collapse the evidence: each variant keeps
+            # its own location, sink and verdict.
+            "variant_details": [
+                {
+                    "id": str(v.get("id") or "unknown"),
+                    "severity": v.get("severity"),
+                    "confidence": v.get("confidence"),
+                    "validation_state": v.get("validation_state"),
+                    "location": v.get("location"),
+                    "sink": v.get("sink"),
+                }
+                for v in variants
+            ],
+            "variant_count": len(variants),
         })
     
-    print(f"  {len(upheld)} upheld findings → {len(deduped)} unique root causes")
-    
+    print(f"  {len(upheld)} carried-forward findings → {len(deduped)} distinct root causes "
+          f"({collapsed} duplicate variant{'s' if collapsed != 1 else ''} collapsed)")
+
+    if accounting is not None:
+        accounting["carried_forward"] = len(upheld)
+        accounting["reported"] = len(deduped)
+        accounting["collapsed_into_variants"] = collapsed
+        accounting["rejected_findings"] = rejected_findings
+
     return deduped
 
 
-def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str = None):
+def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str = None,
+                 accounting: dict = None):
     """Phase 5: Generate structured report."""
     
     print("\n═══ STAGE 5: REPORT ═══")
-    
+
+    accounting = dict(accounting or {})
+    if "reported" in accounting:
+        accounting["expected_reported"] = len(deduped_findings)
+    mismatches = reconcile_funnel(accounting)
+    accounting["reconciles"] = not mismatches
+    accounting["mismatches"] = mismatches
+    planned = accounting.get("patterns_planned", 0)
+    failed = len(accounting.get("hunt_failed", []))
+    accounting["coverage_complete"] = bool(planned) and failed == 0
+
+    # Patterns that were invisible in earlier runs: excluded by the confidence
+    # gate, or never hunted at all.
+    excluded_by_pattern = {}
+    for item in accounting.get("excluded_by_confidence", []):
+        excluded_by_pattern[item["pattern_id"]] = excluded_by_pattern.get(item["pattern_id"], 0) + 1
+    accounting["by_pattern_excluded"] = excluded_by_pattern
+
     report = {
         "generated_at": datetime.now().isoformat(),
         "repository": str(repo_path),
@@ -775,6 +996,7 @@ def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str
             "unvalidated": sum(1 for f in deduped_findings if not f.get("validated")),
             "by_severity": {},
             "by_pattern": {},
+            "funnel": accounting,
         },
         "findings": deduped_findings,
     }
@@ -810,6 +1032,67 @@ def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str
         count = report["summary"]["by_severity"].get(sev, 0)
         if count:
             md_lines.append(f"- **{sev}:** {count}")
+
+    md_lines.append("")
+    md_lines.append("## Coverage and funnel")
+    md_lines.append("")
+    if planned and failed == planned:
+        md_lines.append("**⚠ No pattern produced a hunt result. This report has no coverage "
+                        "and is not a security assessment.**")
+        md_lines.append("")
+    elif failed:
+        md_lines.append(f"**⚠ Coverage is incomplete: {failed} of {planned} patterns produced no "
+                        f"hunt result and were not re-queued.**")
+        md_lines.append("")
+    if accounting.get("reconciles"):
+        md_lines.append("Stage-to-stage counts reconcile. Findings that did not reach the "
+                        "findings list are enumerated below with their reason.")
+    else:
+        md_lines.append("**⚠ This report's stage counts do NOT reconcile — do not cite it as "
+                        "complete until the mismatches below are explained.**")
+    md_lines.append("")
+    if "hunt_emitted" in accounting:
+        md_lines.append(f"- Patterns planned: {accounting.get('patterns_planned', '?')}")
+        md_lines.append(f"- No hunt result: {failed}")
+        md_lines.append(f"- Findings emitted by hunt: {accounting.get('hunt_emitted', 0)}")
+        if accounting.get("gapfill_emitted"):
+            md_lines.append(f"- Findings emitted by gapfill re-queue: "
+                            f"{accounting.get('gapfill_emitted')}")
+        md_lines.append(f"- Excluded before validation (confidence gate): "
+                        f"{len(accounting.get('excluded_by_confidence', []))}")
+        md_lines.append(f"- Sent to adversarial validation: {accounting.get('sent_to_validate', 0)}")
+        verdicts = accounting.get("verdicts", {})
+        md_lines.append(f"- Upheld: {verdicts.get('upheld', 0)} · "
+                        f"Rejected: {verdicts.get('rejected', 0)} · "
+                        f"Unadjudicated: {verdicts.get('unvalidated', 0)}")
+        md_lines.append(f"- Collapsed as duplicate variants: "
+                        f"{accounting.get('collapsed_into_variants', 0)}")
+        md_lines.append(f"- Reported below: {accounting.get('reported', 0)}")
+        md_lines.append("")
+        if accounting.get("hunt_failed"):
+            md_lines.append("**Patterns with no hunt result (coverage gap — not `clean`, and "
+                            "not re-queued by gapfill):**")
+            for item in accounting["hunt_failed"]:
+                md_lines.append(f"- `{item['pattern_id']}` — {item['error']}")
+            md_lines.append("")
+        if accounting.get("excluded_by_confidence"):
+            md_lines.append("**Findings excluded before validation (not a negative result — "
+                            "they were never put to a validator):**")
+            for item in accounting["excluded_by_confidence"]:
+                md_lines.append(f"- `{item['id']}` ({item['pattern_id']}, {item['severity']}) — "
+                                f"{item['confidence']}: {item['reason']}")
+            md_lines.append("")
+        if accounting.get("rejected_findings"):
+            md_lines.append("**Findings rejected by adversarial validation (disproved, not "
+                            "reported):**")
+            for item in accounting["rejected_findings"]:
+                md_lines.append(f"- `{item['id']}` ({item['pattern_id']}, {item['severity']})")
+            md_lines.append("")
+    if not accounting.get("reconciles"):
+        md_lines.append("**⚠ FUNNEL MISMATCH — this report does not reconcile:**")
+        for problem in accounting.get("mismatches", []):
+            md_lines.append(f"- {problem}")
+        md_lines.append("")
     
     # Live intel section — known CVEs in dependencies found during harvest
     if live_context:
@@ -885,6 +1168,7 @@ def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str
             f"**Pattern:** {f.get('pattern', '?')}",
             f"**Location:** `{f.get('location', '?')}`",
             f"**Confidence:** {f.get('confidence', '?')}",
+            f"**Validation:** {f.get('validation_state', 'unknown')}",
             f"",
             f"**Source:** {f.get('source', 'N/A')}",
             f"**Sink:** {f.get('sink', 'N/A')}",
@@ -892,14 +1176,38 @@ def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str
             f"**Attack Scenario:** {f.get('attack_scenario', 'N/A')}",
             f"",
         ])
-        if f.get("variants"):
-            md_lines.append(f"**Variants:** {', '.join(f['variants'])}")
+        if f.get("variant_details"):
+            md_lines.append(f"**Duplicate variants "
+                            f"({f.get('variant_count', len(f['variant_details']))}) — same pattern "
+                            f"and sink, reported once above:**")
+            md_lines.append("")
+            for v in f["variant_details"]:
+                md_lines.append(
+                    f"- `{v.get('id')}` — {v.get('severity')} · {v.get('confidence')} · "
+                    f"{v.get('validation_state')} · `{v.get('location')}` · sink: "
+                    f"{(v.get('sink') or 'n/a')[:160]}"
+                )
             md_lines.append("")
     
     md_path.write_text("\n".join(md_lines))
     
     print(f"  ✓ JSON report: {report_path}")
     print(f"  ✓ Markdown report: {md_path}")
+
+    if mismatches:
+        print("  ⚠ FUNNEL MISMATCH — stage counts do not reconcile:")
+        for problem in mismatches:
+            print(f"      {problem}")
+    elif "hunt_emitted" in accounting:
+        print(f"  ✓ Funnel reconciles: hunt {accounting.get('hunt_emitted')} + gapfill "
+              f"{accounting.get('gapfill_emitted', 0)} = "
+              f"excluded {len(accounting.get('excluded_by_confidence', []))} + "
+              f"validated {accounting.get('sent_to_validate')}; "
+              f"carried {accounting.get('carried_forward')} = "
+              f"reported {accounting.get('reported')} + "
+              f"collapsed {accounting.get('collapsed_into_variants')}")
+    if failed:
+        print(f"  ⚠ COVERAGE INCOMPLETE — {failed} of {planned} patterns produced no hunt result")
 
 
 # ── Batch Execution ──────────────────────────────────────────────────────────
@@ -1115,8 +1423,22 @@ def main():
     # Validate-only mode
     if args.validate_only:
         hunt_results = json.loads(Path(args.validate_only).read_text())
+        assigned = _ensure_finding_ids(hunt_results)
+        if assigned:
+            print(f"  ⚠ {assigned} finding(s) in {args.validate_only} had a missing or "
+                  f"duplicate id — reassigned")
         recon_doc = Path(args.recon_file).read_text() if args.recon_file else "No recon context available"
-        stage_validate(repo_path, recon_doc, hunt_results, args.batch_size)
+        accounting = {}
+        validate_results = stage_validate(repo_path, recon_doc, hunt_results,
+                                          args.batch_size, accounting=accounting)
+        verdicts = accounting.get("verdicts", {})
+        print(f"\n  {len(validate_results)} findings validated "
+              f"({verdicts.get('upheld', 0)} upheld, {verdicts.get('rejected', 0)} rejected, "
+              f"{verdicts.get('unvalidated', 0)} unadjudicated); "
+              f"{len(accounting.get('excluded_by_confidence', []))} excluded by confidence gate.")
+        if accounting.get("sent_to_validate") != sum(verdicts.values()):
+            print("  ⚠ VALIDATION COUNT MISMATCH: "
+                  f"{len(validate_results)} results vs {sum(verdicts.values())} verdicts")
         return
     
     # Stage -1: Intel Harvest
@@ -1149,26 +1471,30 @@ def main():
         recon_doc = stage_recon(repo_path, live_context=live_context)
     
     # Stage 2: Hunt
+    accounting = {}
     patterns = [p.strip() for p in args.patterns.split(",")] if args.patterns else None
-    hunt_results = stage_hunt(repo_path, recon_doc, patterns, args.batch_size, live_context=live_context)
+    hunt_results = stage_hunt(repo_path, recon_doc, patterns, args.batch_size,
+                              live_context=live_context, accounting=accounting)
     
     # Stage 3: Gapfill — re-queue empty patterns with narrowed scope
     if not args.hunt_only and not args.no_gapfill:
         hunt_results = stage_gapfill(repo_path, recon_doc, hunt_results, 
-                                      live_context=live_context, batch_size=args.batch_size)
+                                      live_context=live_context, batch_size=args.batch_size,
+                                      accounting=accounting)
     
     if args.hunt_only:
         print(f"\n  Hunt-only mode — skipping validation/dedupe/report.")
         return
     
     # Stage 4: Validate
-    validate_results = stage_validate(repo_path, recon_doc, hunt_results, args.batch_size)
+    validate_results = stage_validate(repo_path, recon_doc, hunt_results, args.batch_size,
+                                      accounting=accounting)
     
     # Stage 5: Dedupe
-    deduped = stage_dedupe(hunt_results, validate_results)
+    deduped = stage_dedupe(hunt_results, validate_results, accounting=accounting)
     
     # Stage 6: Report
-    stage_report(deduped, repo_path, live_context=live_context)
+    stage_report(deduped, repo_path, live_context=live_context, accounting=accounting)
     
     total = len(deduped)
     critical = sum(1 for f in deduped if f.get("severity") == "CRITICAL")
@@ -1176,7 +1502,7 @@ def main():
     
     print(f"\n{'═' * 60}")
     print(f"  Harness complete.")
-    print(f"  {total} validated findings ({critical} CRITICAL, {high} HIGH)")
+    print(f"  {total} reported findings ({critical} CRITICAL, {high} HIGH)")
     print(f"{'═' * 60}")
 
 
