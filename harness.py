@@ -43,11 +43,12 @@ PI_TIMEOUT = 600        # seconds per session (10 min)
 PI_MODE = "json"        # "print" for plain text, "json" for structured events
 
 # Models + thinking — hunters can be cheaper/faster, validators should think deeper
-HUNTER_MODEL = "deepseek/deepseek-v4-flash:low"
-RECON_MODEL = "deepseek/deepseek-v4-flash:medium"
+# deepseek-flash is a floating alias on the DeepSeek API: always the latest Flash (currently V4.1-Flash).
+HUNTER_MODEL = "deepseek/deepseek-flash:low"
+RECON_MODEL = "deepseek/deepseek-flash:medium"
 VALIDATOR_MODEL = "deepseek/deepseek-v4-pro:high"
 # Thinking levels: off, minimal, low, medium, high, xhigh
-# Model shorthand: "provider/model:thinking" e.g. "deepseek/deepseek-v4-flash:low"
+# Model shorthand: "provider/model:thinking" e.g. "deepseek/deepseek-flash:low"
 
 # ── Attack Patterns (from web-vuln-audit skill) ──────────────────────────────
 

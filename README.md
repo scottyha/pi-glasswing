@@ -25,9 +25,9 @@ Report (JSON + Markdown)
 | Stage | Model | Thinking | What it does |
 |-------|-------|----------|--------------|
 | **Intel** | N/A (API queries) | — | Harvests live vulnerabilities from OSV, GitHub Advisories, CISA KEV, NVD, npm audit, Scorecard |
-| **Recon** | DeepSeek V4 Flash | medium | Single pi session maps trust boundaries, entry points, data flows, auth |
-| **Hunt** | DeepSeek V4 Flash | low | 44 parallel pi sessions, each scoped to one attack pattern |
-| **Gapfill** | DeepSeek V4 Flash | low | Second pass for patterns that found nothing — uses recon doc clues |
+| **Recon** | DeepSeek Flash (latest alias) | medium | Single pi session maps trust boundaries, entry points, data flows, auth |
+| **Hunt** | DeepSeek Flash (latest alias) | low | 44 parallel pi sessions, each scoped to one attack pattern |
+| **Gapfill** | DeepSeek Flash (latest alias) | low | Second pass for patterns that found nothing — uses recon doc clues |
 | **Validate** | DeepSeek V4 Pro | high | Adversarial — can only disprove findings, not propose new ones |
 | **Dedupe** | Python | — | Same root cause + location → single record with variants |
 | **Report** | Python | — | Structured JSON + human-readable Markdown |
