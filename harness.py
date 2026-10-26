@@ -691,8 +691,12 @@ def stage_validate(repo_path: str, recon_doc: str, hunt_results: list[dict],
             status = "✗ REJECTED" if verdict.get("rejected") else "✓ UPHELD"
             print(f"    {status}: {result['finding_id']}")
         else:
-            result["verdict"] = {"rejected": False, "reasoning": "validation failed"}
-            print(f"    ⚠ ERROR: {result['finding_id']} — {result.get('error', 'unknown')}")
+            result["verdict"] = {
+                "rejected": None,
+                "failed": True,
+                "reasoning": f"validation failed: {result.get('error', 'unknown')}",
+            }
+            print(f"    ⚠ UNVALIDATED: {result['finding_id']} — {result.get('error', 'unknown')}")
     
     return validate_results
 
@@ -704,21 +708,30 @@ def stage_dedupe(hunt_results: list[dict], validate_results: list[dict]) -> list
     
     # Build rejection set from validation
     rejected_ids = set()
+    unvalidated_ids = set()
     for vr in validate_results:
         verdict = vr.get("verdict", {})
-        if verdict.get("rejected"):
-            rejected_ids.add(vr.get("finding_id"))
+        fid = vr.get("finding_id")
+        if verdict.get("failed"):
+            # Fail-closed: a validator that could not speak did not validate anything.
+            unvalidated_ids.add(fid)
+        elif verdict.get("rejected"):
+            rejected_ids.add(fid)
     
     # Collect upheld findings
     upheld = []
     for pattern_result in hunt_results:
         for finding in pattern_result.get("findings", []):
             fid = finding.get("id", "")
-            if fid not in rejected_ids and finding.get("confidence") in ("CONFIRMED", "SUSPECTED"):
+            if fid in rejected_ids:
+                continue
+            if finding.get("confidence") in ("CONFIRMED", "SUSPECTED"):
+                unvalidated = fid in unvalidated_ids
                 upheld.append({
                     **finding,
                     "pattern": pattern_result["pattern_id"],
-                    "validated": fid not in rejected_ids,
+                    "validated": not unvalidated,
+                    "validation_state": "unvalidated" if unvalidated else "validated",
                 })
     
     # Group by root cause (same file + same vulnerability class)
@@ -758,6 +771,8 @@ def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str
         "repository": str(repo_path),
         "summary": {
             "total_findings": len(deduped_findings),
+            "validated": sum(1 for f in deduped_findings if f.get("validated")),
+            "unvalidated": sum(1 for f in deduped_findings if not f.get("validated")),
             "by_severity": {},
             "by_pattern": {},
         },
@@ -783,7 +798,9 @@ def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str
         f"",
         f"**Repository:** `{repo_path}`",
         f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"**Findings:** {len(deduped_findings)}",
+        f"**Findings:** {len(deduped_findings)} (validated: {report['summary']['validated']}, unvalidated: {report['summary']['unvalidated']})",
+        f"",
+        f"*Unvalidated = the adversarial validator timed out or errored. These findings were NOT defended; treat as raw leads, not verified findings.*",
         f"",
         f"## Summary",
         f"",
