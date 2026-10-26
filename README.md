@@ -2,7 +2,7 @@
 
 > Parallel AI agent harness for web vulnerability discovery. Architecture adapted from Cloudflare's [Project Glasswing](https://blog.cloudflare.com/cyber-frontier-models/).
 
-**pi-glasswing** orchestrates parallel [pi](https://github.com/earendil-works/pi-coding-agent) sessions to discover web application vulnerabilities. Each session is a fresh agent with full context window dedicated to one attack pattern — avoiding the context compaction problem where a single agent covering 44 patterns forgets earlier findings by pattern #30.
+**pi-glasswing** orchestrates parallel [pi](https://github.com/earendil-works/pi-coding-agent) sessions to discover web application vulnerabilities. Each session is a fresh agent with full context window dedicated to one attack pattern — avoiding the context compaction problem where a single agent covering 48 patterns forgets earlier findings by pattern #30.
 
 ## Pipeline
 
@@ -11,7 +11,7 @@ Intel Harvest (live CVE data from free APIs)
   ↓
 Recon (architecture doc + live context injected)
   ↓
-Hunt (~44 parallel agents, one per attack pattern)
+Hunt (~48 parallel agents, one per attack pattern)
   ↓
 Gapfill (re-queues empty patterns with narrowed scope from recon clues)
   ↓
@@ -26,7 +26,7 @@ Report (JSON + Markdown)
 |-------|-------|----------|--------------|
 | **Intel** | N/A (API queries) | — | Harvests live vulnerabilities from OSV, GitHub Advisories, CISA KEV, NVD, npm audit, Scorecard |
 | **Recon** | DeepSeek Flash (latest alias) | medium | Single pi session maps trust boundaries, entry points, data flows, auth |
-| **Hunt** | DeepSeek Flash (latest alias) | low | 44 parallel pi sessions, each scoped to one attack pattern |
+| **Hunt** | DeepSeek Flash (latest alias) | low | 48 parallel pi sessions, each scoped to one attack pattern |
 | **Gapfill** | DeepSeek Flash (latest alias) | low | Second pass for patterns that found nothing — uses recon doc clues |
 | **Validate** | DeepSeek V4 Pro | high | Adversarial — can only disprove findings, not propose new ones |
 | **Dedupe** | Python | — | Same root cause + location → single record with variants |
@@ -55,22 +55,22 @@ python3 vulnerability_context.py /path/to/target-repo
 
 - **pi** (≥0.74) — the coding agent CLI. [Install](https://github.com/earendil-works/pi-coding-agent)
 - **Python** ≥3.10 with `requests`
-- **Attack patterns** — 44 patterns at `./skill/patterns-*.md`
+- **Attack patterns** — 48 patterns at `./skill/patterns-*.md`
 - **WooYun knowledge base** (optional) — 86MB of real-world bypass techniques at `./wooyun-categories/`. From [tanweai/wooyun-legacy](https://github.com/tanweai/wooyun-legacy) (MIT). Skip or delete — harness degrades gracefully.
 
-## Attack Patterns (44)
+## Attack Patterns (48)
 
 ### Next.js (12)
 `missing-auth`, `middleware-bypass`, `server-component-leak`, `client-secrets`, `fail-open-defaults`, `unvalidated-server-action`, `server-action-no-auth`, `error-state-leak`, `debug-in-prod`, `path-traversal`, `open-redirect`, `ssrf-image-loader`
 
-### PostgreSQL (10)
+### PostgreSQL (11)
 `sql-injection` 📚WooYun, `dynamic-table-names`, `over-privileged-db-user`, `connection-string-leak`, `embedding-manipulation`, `vector-query-injection`, `unclosed-connections`, `select-star-leak`, `missing-rls`, `race-condition-leads`
 
 ### LLM Chat Agent (10)
 `prompt-extraction`, `indirect-prompt-injection`, `multi-turn-injection`, `data-injection`, `unauthorized-function-call`, `llm-as-oracle`, `response-leakage`, `expensive-vector-abuse`, `context-exhaustion`, `unsanitised-input`
 
-### Infrastructure (12)
-`missing-headers`, `weak-csp`, `permissive-cors`, `missing-cors-public`, `weak-tls`, `mixed-content`, `server-info-disclosure`, `sensitive-files`, `missing-rate-limit`, `proxying-internal`, `insecure-cookies`, `origin-ip-exposed`
+### Infrastructure (15)
+`missing-headers`, `weak-csp`, `permissive-cors`, `missing-cors-public`, `weak-tls`, `mixed-content`, `server-info-disclosure`, `sensitive-files`, `missing-rate-limit`, `proxying-internal`, `insecure-cookies`, `origin-ip-exposed`)`), `unbounded-parsing`, `cache-key-vulnerability`
 
 📚WooYun = supplemented with bypass techniques from the WooYun knowledge base (88,636 real vulnerability cases, 2010–2016)
 
@@ -93,7 +93,7 @@ All free, no signup required:
 | Flag | Description |
 |------|-------------|
 | `--batch-size N` | Concurrent pi sessions per batch (default: 8) |
-| `--patterns x,y,z` | Comma-separated pattern IDs to run (default: all 44) |
+| `--patterns x,y,z` | Comma-separated pattern IDs to run (default: all 48) |
 | `--skip-recon` | Skip recon (requires `--recon-file`) |
 | `--recon-file PATH` | Use existing recon doc |
 | `--hunt-only` | Stop after hunt (skip validate/dedupe/report) |
@@ -110,7 +110,7 @@ All free, no signup required:
 ~/projects/pi-glasswing/
 ├── harness.py                   ← main pipeline orchestrator
 ├── vulnerability_context.py     ← live intel harvester
-├── skill/                       ← 44 attack patterns (patterns-*.md)
+├── skill/                       ← 48 attack patterns (patterns-*.md)
 │   ├── patterns-nextjs.md
 │   ├── patterns-postgres.md
 │   ├── patterns-chat-agent.md
@@ -139,7 +139,7 @@ All free, no signup required:
 
 ### Why parallel narrow agents over one exhaustive agent
 
-From Cloudflare's Project Glasswing research: a single agent covering 44 patterns covers ~0.1% of a codebase's attack surface before context compaction discards earlier findings. 44 agents with one job each beat 1 agent with 44 jobs.
+From Cloudflare's Project Glasswing research: a single agent covering 48 patterns covers ~0.1% of a codebase's attack surface before context compaction discards earlier findings. 48 agents with one job each beat 1 agent with 48 jobs.
 
 ### Why adversarial validation
 
@@ -152,7 +152,7 @@ Agents drift toward attack classes they've already found success in. A hunter th
 ## Attribution
 
 - **Cloudflare Project Glasswing** — harness architecture (recon → hunt → validate → gapfill → trace → feedback)
-- **Trail of Bits** — code review methodology adapted into the 44 attack patterns
+- **Trail of Bits** — code review methodology adapted into the 48 attack patterns
 - **WooYun** — 88,636 real vulnerability cases from [tanweai/wooyun-legacy](https://github.com/tanweai/wooyun-legacy). The sql-injection pattern is supplemented with bypass techniques from this knowledge base.
 - **DataDog GuardDog** — supply chain behavior analysis methodology (arXiv 2603.27549)
 - **NodeSecure** — AST-level JavaScript analysis methodology

@@ -217,6 +217,34 @@ grep -rn "INSERT INTO.*chat_leads\|INSERT INTO.*leads" --include="*.ts" --includ
 
 ---
 
+## 7. Import and ETL SQL Assembly (cross-cutting)
+
+### Pattern: Import and ETL SQL Assembly from Documents
+
+Hunt for offline import/ETL scripts (migrations, enrichment, spreadsheet loaders) that assemble SQL text from parsed document/spreadsheet values — the batch sibling of runtime SQL injection.
+
+**What to search for:**
+
+```bash
+# SQL assembled via interpolation from parsed values in scripts
+grep -rnE "(f"|f'|\.format\().*INSERT|UPDATE|DELETE|CREATE|ALTER" --include='*.py' --include='*.sh' --include='*.mjs' scripts/ ops/ migrations/ | head -20
+
+# Literal quoting: where do document-derived strings get escaped before entering SQL text?
+grep -rnE "(quote|escape|replace\(["']'|\$\$|\$[a-zA-Z]+\$|DO \\$\$|COPY .* FROM)" --include='*.py' --include='*.sh' scripts/ ops/ | head -20
+
+# Value -> SQL boundary: trace one parsed cell from parse_xlsx/parse_csv to the SQL string
+```
+
+**What counts as a finding:**
+- A document-derived string (spreadsheet cell, CSV field, PDF-extracted text, agreement metadata) that can terminate the outer SQL delimiter — fixed dollar-quoting `$$…$$` blocks or `$tag$` tokens, single-quote boundaries without doubling, `\.` sentinel lines in COPY payloads — with no escape applied to data. The import runs with elevated production privileges, so a crafted cell is batch SQL injection — HIGH.
+- Quote-doubling absent anywhere values cross `'{s}'` boundaries in f-string SQL — HIGH.
+- SQL text built from values where the only defense is a length/character filter that a crafted document can bypass — MEDIUM.
+- psql stdin transport (script pipes SQL text to `psql`) with data lines interleaved into the SQL stream — treat delimiters as attacker-controllable — HIGH.
+
+**Severity discipline:** import scripts typically authenticate as the admin role to production; any injection there is CRITICAL/HIGH despite being "offline tooling". Check whether the delimiter/escape is derived from data (attacker-settable) or fixed and escaped (safe).
+
+---
+
 ## Quick Detection Commands
 
 ```bash

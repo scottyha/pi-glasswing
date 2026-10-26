@@ -101,6 +101,10 @@ PATTERNS = {
     "proxying-internal":        {"layer": "infra",       "name": "Proxying Internal Services"},
     "insecure-cookies":         {"layer": "infra",       "name": "Insecure Cookie Flags"},
     "origin-ip-exposed":        {"layer": "infra",       "name": "Origin IP Exposed"},
+    "secrets-in-source":        {"layer": "infra",       "name": "Secrets Committed to Source"},
+    "unbounded-parsing":        {"layer": "infra",       "name": "Unbounded Parsing and Buffering"},
+    "cache-key-vulnerability":  {"layer": "infra",       "name": "Cache Key and Variant Poisoning"},
+    "etl-sql-assembly":         {"layer": "postgres",     "name": "Import/ETL SQL Assembly from Documents"},
 }
 
 # Layer → skill pattern file mapping
@@ -638,6 +642,10 @@ def _map_recon_to_patterns(empty_patterns: list[dict], notable_section: str) -> 
         "client-secrets": [".env", "credential", "secret", "API key", "OAuth", "token", "env.local"],
         "select-star-leak": ["SELECT *", "all columns", "excessive data", "data leak", "query_database"],
         "embedding-manipulation": ["embedding", "vector", "pgvector", "vector search", "Gemini Embedding"],
+        "secrets-in-source": ["password", "credential", "secret", "API key", "token", "migration", ".env", "connection string", "hardcoded", "CREATE ROLE", "provision"],
+        "unbounded-parsing": ["XML", "archive", "zip", "upload", "import", "spreadsheet", "parser", "buffering", "size limit", "decompress", "memory"],
+        "cache-key-vulnerability": ["cache", "CDN", "Vary", "variant", "edge", "poison", "header", "treatment", "assignment", "bucket"],
+        "etl-sql-assembly": ["import", "ETL", "psql", "COPY", "dollar quote", "SQL assembly", "delimiter", "migration", "spreadsheet", "enrich"],
         "vector-query-injection": ["vector", "embedding", "pgvector", "cosine similarity", "vector search"],
         "ssrf-image-loader": ["SSRF", "image", "loader", "next/image", "fetch", "external URL"],
         "unclosed-connections": ["connection", "pool", "memory", "cleanup", "in-memory", "session"],

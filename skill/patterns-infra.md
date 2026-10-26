@@ -269,6 +269,103 @@ dig ftp.example.com A
 
 ---
 
+## 7. Secrets in Source (cross-cutting)
+
+### Pattern: Secrets in Source
+
+Hunt for credentials committed to the repository itself, regardless of file type.
+
+**What to search for:**
+
+```bash
+# Role/user provisioning with literal passwords (SQL migrations!)
+grep -rnE "(CREATE|ALTER)\s+(ROLE|USER)[^;]*PASSWORD\s*'[A-Za-z0-9/_-]+'" --include='*.sql' .
+grep -rnE "PASSWORD\s*'[A-Za-z0-9/_-]{6,}'" --include='*.sql' .
+
+# DSN / connection strings with inline password (any language or config)
+grep -rnE "(password|passwd|pwd)\s*[:=]\s*["']?[A-Za-z0-9!/_+-]{6,}" --include='*.py' --include='*.js' --include='*.ts' --include='*.json' --include='*.toml' --include='*.yml' --include='*.sh' . | grep -viE "example|placeholder|your-key|\$\{|process\.env|os\.environ|\.env\[|getenv"
+
+# API keys / tokens as literals
+grep -rnE "sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{30,}|AKIA[A-Z0-9]{16}|xox[ba]-" --include='*' .
+
+# Committed env files with real (non-placeholder) values
+find . -name ".env*" -not -name ".env.example" -not -path "*/node_modules/*"
+grep -cE "^[A-Z_]+=." .env.example 2>/dev/null  # then diff example values against placeholder heuristics
+
+# Secrets in docs/scripts/deploy tooling
+grep -rnE "(secret|token|password|api[_-]?key)" --include='*.md' --include='*.sh' -i . | grep -iE "actual|real:|prod|= *['"][A-Za-z0-9!/_+-]{8,}" | head -20
+```
+
+**What counts as a finding:**
+- SQL migrations provisioning roles/users with a literal password (`CREATE ROLE x LOGIN PASSWORD '…'`) — **CRITICAL** if production is provisioned from it and the credential is not rotated post-migration. Check whether a rotation step exists anywhere in the repo.
+- DSN strings with inline passwords in constants — HIGH.
+- API keys/tokens as literals — HIGH (material access) / MEDIUM (limited scope).
+- A committed `.env` (not template) with real values — HIGH per key.
+- `.env.example` entries whose values are real-looking (a live endpoint, a true host with private IP, realistic keys) — MEDIUM info disclosure, LOW if fully synthetic.
+
+**Severity discipline:** the location (source) matters less than the credential's privilege. A literal used to provision an admin DB role outranks a leaked analytics key. Cross-check: is the credential imported/used by code that reaches production?
+
+---
+
+## 8. Unbounded Parsing and Buffering (cross-cutting)
+
+### Pattern: Unbounded Parsing and Buffering
+
+Hunt for user-controlled data parsed or buffered without resource bounds — decompression bombs, entity expansion, unbounded archive extraction, fetch-all-then-slice.
+
+**What to search for:**
+
+```bash
+# XML/DOM/archive parsers reachable from upload/import entry points
+grep -rnE "(xml\.etree|ElementTree|minidom|lxml|BeautifulSoup|jsdom|DOMParser|fast-xml-parser|xml2js|unzipper|adm-zip|tarfile|zipfile|yauzl)" --include='*.py' --include='*.js' --include='*.ts' .
+
+# For each parser hit: is any bound enforced? (zipped size, entity count, output cap)
+grep -rnE "(filesize|fstat|getsize|maxSize|MAX_|unzippedSize|st_size|content-length|contentLength)" <parser-file>
+
+# Fetch-all-then-slice: full SELECT buffered before LIMIT/truncation in code
+grep -rnE "(fetchall\(\)|\.\.get\(\)|await .*\.query\([^)]*SELECT[^;]*$)" --include='*.py' --include='*.ts' -A2 | grep -B2 -A2 "LIMIT\|slice\|substring\|take(" | head
+```
+
+**What counts as a finding:**
+- User-uploaded archive/XML parsed without a size cap on the *expanded* content (zip bomb / entity expansion / billion-laughs class) — HIGH if anonymous, MEDIUM if admin-gated.
+- Streaming absence: whole decompressed blob into memory (no `iterparse`, no `ZipExtFile` size checks) — MEDIUM.
+- Query results fetched without LIMIT then truncated in application code — MEDIUM (amplification exists on the DB side).
+- Import/ETL paths that build SQL from parsed documents: if a document-derived string can terminate the outer SQL delimiter (fixed dollar-quoting `$$…$$`, `\E`/`
+` sentinel tokens, or any fixed delimiter chosen from data without escaping), that is SQL injection-class — HIGH.
+- JSON request bodies parsed with no size ceiling and no framework body limit — MEDIUM.
+
+**Severity discipline:** reachability decides. Anonymous public endpoint → HIGH; admin/import-tool endpoint → MEDIUM unless credential exposure of results raises impact.
+
+---
+
+## 9. Cache Key and Variant Poisoning (cross-cutting)
+
+### Pattern: Cache Key and Variant Poisoning
+
+Hunt for client-controlled request data (headers, cookies, query parameters) that changes rendered output while not being part of the cache key — the classic edge/CDN poisoning class, plus its Next.js/edge-variant form.
+
+**What to search for:**
+
+```bash
+# Where does response HTML differ by request input?
+grep -rnE "(headers\(\)|cookies\(\)|searchParams|req\.headers|request\.headers|cf-[a-z-]+|x-[a-z-]+)" --include='*.ts' --include='*.tsx' --include='*.js' src/ proxy* middleware* | grep -viE "content-type|user-agent: \*" | head -30
+
+# Variant branching (page treatments, A/B assignment, show/hide chrome)
+grep -rnE "(variant|treatment|assignment|hide[A-Z_|-]*Chrome|showChrome|bucket)" --include='*.ts' --include='*.tsx' src/ | head -30
+
+# Cache configuration: Vary on those fields? Cache-Control of dynamic responses?
+grep -rnE "(Vary|Cache-Control|s-maxage|stale-while)" --include='*.ts' --include='*.js' --include='*.yml' --include='*.toml' .
+```
+
+**What counts as a finding:**
+- Server-rendered output depends on a request field (header/cookie/query) that is NOT declared in `Vary` and IS cached — attacker sets their field, seeds their response into shared cache, other visitors get the poisoned variant — HIGH.
+- Default-assignment paths where the variant cookie/header can be set arbitrarily by the client and the response is cache-eligible — MEDIUM-HIGH.
+- Dynamic per-principal responses served with shared (public) cache headers — MEDIUM.
+- Absent/weak `Cache-Control` on private responses paired with a CDN in front — context-dependent.
+
+**Severity discipline:** shared-cache poisoning of public content for other users is HIGH; self-affecting variant abuse is MEDIUM. Always name the unkeyed field and the cached route.
+---
+
 ## Quick Detection Commands
 
 ```bash
