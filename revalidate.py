@@ -96,10 +96,19 @@ def main():
             finding["validated"] = True
             finding["validation_state"] = "validated"
     now = datetime.now()
+    sev_counts = {}
+    pat_counts = {}
+    for f in report["findings"]:
+        s = f.get("severity", "UNKNOWN")
+        sev_counts[s] = sev_counts.get(s, 0) + 1
+        p = f.get("pattern", "unknown")
+        pat_counts[p] = pat_counts.get(p, 0) + 1
     report["summary"]["validated"] = sum(1 for f in report["findings"] if f.get("validated"))
     report["summary"]["unvalidated"] = sum(1 for f in report["findings"] if not f.get("validated"))
     report["summary"]["revalidated_rejected"] = len(removed)
     report["summary"]["total_findings"] = len(report["findings"])
+    report["summary"]["by_severity"] = sev_counts
+    report["summary"]["by_pattern"] = pat_counts
     report["revalidation_note"] = (
         f"Revalidated {len(items)} findings whose validators timed out (DeepSeek balance outage "
         f"mid-run). Fixed fail-closed semantics applied. {len(removed)} of the revalidated were "
@@ -114,14 +123,13 @@ def main():
     # Corrected markdown: regenerate summary header from the original, keep body
     orig_md = Path(harness.RESULTS_DIR) / "report-20261026-153259.md"
     md_text = orig_md.read_text()
-    sev_counts = report["summary"].get("by_severity", {})
-    rec_sev = [v for v in report["findings"] if v.get("validated")]
     header = (
         f"# Vulnerability Assessment Report (REVALIDATED)\n\n"
         f"**Repository:** `/home/mom/projects/rpl-it-website`\n"
         f"**Date:** {now.strftime('%Y-%m-%d %H:%M')}\n"
         f"**Findings:** {len(report['findings'])} (validated: {report['summary']['validated']}, unvalidated: {report['summary']['unvalidated']})\n\n"
-        f"*Original run lost DeepSeek balance mid-validation; 27 validators timed out and the "
+        + "".join(f"- **{s.upper()}:** {c}\n" for s, c in report["summary"]["by_severity"].items() if s != "UNKNOWN")
+        + f"\n*Original run lost DeepSeek balance mid-validation; 27 validators timed out and the "
         f"pre-fix harness logged them as validated. This corrected report re-ran those "
         f"validators under fail-closed semantics: {len(removed)} were subsequently DISPROVED "
         f"and removed; the rest are marked unvalidated or validated accordingly. "
@@ -131,13 +139,13 @@ def main():
     body_start = md_text.find("## Summary")
     # keep the original body after its summary section header block (severity bullets + intel)
     rest = md_text[body_start:]
-    # drop the original severity bullet block (3 lines after header) to avoid stale counts
+    # drop the original severity bullet block to avoid stale counts
     lines = rest.split("\n")
     # find first non-bullet content after "## Summary"
-    drop_to = 0
+    drop_to = 2
     in_bullets = True
     for i, l in enumerate(lines[2:], start=2):
-        if in_bullets and (l.startswith("- **") or l.startswith("  ") or l.strip() == ""):
+        if in_bullets and (l.startswith("- **") or l.strip() == ""):
             continue
         else:
             drop_to = i
