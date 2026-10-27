@@ -879,6 +879,110 @@ def stage_validate(repo_path: str, recon_doc: str, hunt_results: list[dict],
     return validate_results
 
 
+TEMPLATE_ONLY_SEVERITY_CAP = "HIGH"
+# These assert disclosure of committed material in the repository, which a
+# template file proves; the cap targets claims about deployed runtime configuration.
+TEMPLATE_CAP_EXEMPT_PATTERNS = {"secrets-in-source", "origin-ip-exposed"}
+TEMPLATE_MARKERS = {"example", "sample", "template", "dist", "default", "defaults"}
+CONFIG_EXTENSIONS = {".ini", ".cfg", ".conf", ".yml", ".yaml", ".json", ".toml"}
+NON_RUNTIME_DIRS = {"docs", "doc", "fixtures", "__fixtures__", "tests", "test"}
+
+
+def normalize_ref(p: str) -> str | None:
+    """Normalize filesystem references, never network references."""
+    p = p.replace("\\", "/")
+    if "://" in p or p.startswith("//"):
+        return None
+    return p.rstrip("/") or None
+
+
+def is_config_file(name: str) -> bool:
+    """Recognize config basenames, not arbitrary example-suffixed files."""
+    if "(" in name:
+        return False
+    name = name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if name in {"process.env", "import.meta.env", "os.environ"}:
+        return False
+    return (not name.startswith("readme") and
+            (name == ".env" or name.startswith(".env.")
+             or Path(name).suffix in CONFIG_EXTENSIONS))
+
+
+def excluded_config_ref(path: str) -> bool:
+    return any(part.lower() in NON_RUNTIME_DIRS for part in path.split("/")[:-1])
+
+
+def is_template_path(p: str) -> bool:
+    """A config-shaped file with an explicit dotted template marker."""
+    path = normalize_ref(p)
+    if not path or p.endswith(("/", "\\")) or excluded_config_ref(path):
+        return False
+    name = path.rsplit("/", 1)[-1]
+    if not is_config_file(name):
+        return False
+    # Env names carry their marker after .env; other configs before their suffix.
+    segments = (name.lower().split(".")[2:] if name.lower().startswith(".env.")
+                else Path(name).stem.lower().split(".")[1:])
+    return bool(TEMPLATE_MARKERS.intersection(segments))
+
+
+def extract_config_refs(finding: dict) -> tuple[list[str], list[str]]:
+    """Find bare or line-qualified config paths in the finding schema fields."""
+    templates, configs = set(), set()
+    for field in ("location", "source", "sink", "attack_scenario"):
+        text = finding.get(field, "")
+        if not isinstance(text, str):
+            text = json.dumps(text)
+        # Keep URL tokens whole so their path/host fragments cannot become refs.
+        for match in re.finditer(r"[^\s`\"'<>,;=]+", text):
+            token = match.group().lstrip("{}[]()`\"'")
+            # Preserve call syntax until after tokenization: res.json is not a file.
+            if "(" in token or text[match.end():].lstrip().startswith("("):
+                continue
+            token = token.rstrip("{}[]()`\"'").rstrip(".:")
+            token = re.sub(r"(?::\d+(?:-\d+)?)+$", "", token)
+            path = normalize_ref(token)
+            if (not path or token.endswith(("/", "\\"))
+                    or excluded_config_ref(path)):
+                continue
+            if not is_config_file(path.rsplit("/", 1)[-1]):
+                continue
+            if is_template_path(path):
+                templates.add(path)
+            else:
+                configs.add(path)
+    return sorted(templates), sorted(configs)
+
+
+def apply_template_severity_cap(finding: dict) -> dict:
+    """Cap only CRITICAL runtime claims supported solely by template config."""
+    if (finding.get("severity") != "CRITICAL"
+            or finding.get("pattern") in TEMPLATE_CAP_EXEMPT_PATTERNS):
+        return finding
+    templates, configs = extract_config_refs(finding)
+    if not templates or configs:
+        return finding
+    finding["severity"] = TEMPLATE_ONLY_SEVERITY_CAP
+    if finding.get("confidence") == "CONFIRMED":
+        finding["confidence"] = "SUSPECTED"
+    caveat = (f"⚠ Severity capped at HIGH: config value sourced from committed template "
+              f"{', '.join(templates)}, not verified against the deployed configuration.")
+    existing = finding.get("severity_caveat", "")
+    finding["severity_caveat"] = f"{existing}\n{caveat}".strip()
+    print(f"  ⚠ TEMPLATE-ONLY: {finding.get('id', '?')} <CRITICAL→HIGH>")
+    # Keep the caveat directly beside severity in serialized JSON as well.
+    ordered = {}
+    for key, value in finding.items():
+        if key == "severity_caveat":
+            continue
+        ordered[key] = value
+        if key == "severity":
+            ordered["severity_caveat"] = finding["severity_caveat"]
+    finding.clear()
+    finding.update(ordered)
+    return finding
+
+
 def stage_dedupe(hunt_results: list[dict], validate_results: list[dict],
                  accounting: dict = None) -> list[dict]:
     """Phase 4: Deduplicate findings by root cause. Collapse variants."""
@@ -914,9 +1018,10 @@ def stage_dedupe(hunt_results: list[dict], validate_results: list[dict],
                 continue
             if finding.get("confidence") in ("CONFIRMED", "SUSPECTED"):
                 unvalidated = fid in unvalidated_ids
+                candidate = {**finding, "pattern": pattern_result["pattern_id"]}
+                apply_template_severity_cap(candidate)
                 upheld.append({
-                    **finding,
-                    "pattern": pattern_result["pattern_id"],
+                    **candidate,
                     "validated": not unvalidated,
                     "validation_state": "unvalidated" if unvalidated else "validated",
                 })
@@ -950,6 +1055,7 @@ def stage_dedupe(hunt_results: list[dict], validate_results: list[dict],
                 {
                     "id": str(v.get("id") or "unknown"),
                     "severity": v.get("severity"),
+                    **({"severity_caveat": v["severity_caveat"]} if v.get("severity_caveat") else {}),
                     "confidence": v.get("confidence"),
                     "validation_state": v.get("validation_state"),
                     "location": v.get("location"),
@@ -1021,21 +1127,49 @@ def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str
     report_path = RESULTS_DIR / f"report-{ts}.json"
     report_path.write_text(json.dumps(report, indent=2))
     
-    # Human-readable markdown
     md_path = RESULTS_DIR / f"report-{ts}.md"
+    write_report_markdown(report, md_path, live_context)
+    print(f"  ✓ JSON report: {report_path}")
+    print(f"  ✓ Markdown report: {md_path}")
+    if mismatches:
+        print("  ⚠ FUNNEL MISMATCH — stage counts do not reconcile:")
+        for problem in mismatches:
+            print(f"      {problem}")
+    elif "hunt_emitted" in accounting:
+        print(f"  ✓ Funnel reconciles: hunt {accounting.get('hunt_emitted')} + gapfill "
+              f"{accounting.get('gapfill_emitted', 0)} = "
+              f"excluded {len(accounting.get('excluded_by_confidence', []))} + "
+              f"validated {accounting.get('sent_to_validate')}; "
+              f"carried {accounting.get('carried_forward')} = "
+              f"reported {accounting.get('reported')} + "
+              f"collapsed {accounting.get('collapsed_into_variants')}")
+    if failed:
+        print(f"  ⚠ COVERAGE INCOMPLETE — {failed} of {planned} patterns produced no hunt result")
+
+
+def write_report_markdown(report: dict, md_path: Path, live_context: str = None) -> None:
+    """Render only the supplied report, also used by offline artifact rebuilds."""
+    deduped_findings = report["findings"]
+    repo_path = report["repository"]
+    accounting = report["summary"].get("funnel", {})
+    planned = accounting.get("patterns_planned", 0)
+    failed = len(accounting.get("hunt_failed", []))
     md_lines = [
         f"# Vulnerability Assessment Report",
         f"",
         f"**Repository:** `{repo_path}`",
-        f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"**Date:** {report['generated_at'][:16].replace('T', ' ')}",
         f"**Findings:** {len(deduped_findings)} (validated: {report['summary']['validated']}, unvalidated: {report['summary']['unvalidated']})",
         f"",
-        f"*Unvalidated = the adversarial validator timed out or errored. These findings were NOT defended; treat as raw leads, not verified findings.*",
-        f"",
-        f"## Summary",
-        f"",
     ]
-    
+    if report.get("revalidation_note"):
+        md_lines.extend([report["revalidation_note"], ""])
+    md_lines.extend([
+        "*Unvalidated = the adversarial validator timed out or errored. These findings were NOT defended; treat as raw leads, not verified findings.*",
+        "",
+        "## Summary",
+        "",
+    ])
     for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
         count = report["summary"]["by_severity"].get(sev, 0)
         if count:
@@ -1052,7 +1186,11 @@ def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str
         md_lines.append(f"**⚠ Coverage is incomplete: {failed} of {planned} patterns produced no "
                         f"hunt result and were not re-queued.**")
         md_lines.append("")
-    if accounting.get("reconciles"):
+    if not accounting:
+        md_lines.append("**⚠ No funnel accounting was recorded. Pattern coverage and "
+                        "stage-to-stage reconciliation are unknown; do not cite this "
+                        "report as a complete assessment.**")
+    elif accounting.get("reconciles"):
         md_lines.append("Stage-to-stage counts reconcile. Findings that did not reach the "
                         "findings list are enumerated below with their reason.")
     else:
@@ -1096,9 +1234,9 @@ def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str
             for item in accounting["rejected_findings"]:
                 md_lines.append(f"- `{item['id']}` ({item['pattern_id']}, {item['severity']})")
             md_lines.append("")
-    if not accounting.get("reconciles"):
+    if accounting and not accounting.get("reconciles"):
         md_lines.append("**⚠ FUNNEL MISMATCH — this report does not reconcile:**")
-        for problem in accounting.get("mismatches", []):
+        for problem in accounting.get("mismatches") or ["Funnel accounting is incomplete."]:
             md_lines.append(f"- {problem}")
         md_lines.append("")
     
@@ -1172,6 +1310,7 @@ def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str
     for f in sorted(deduped_findings, key=lambda x: sev_order.get(x.get("severity", "LOW"), 99)):
         md_lines.extend([
             f"### {f.get('id', '?')} — {f.get('severity', '?')}",
+            *([f["severity_caveat"]] if f.get("severity_caveat") else []),
             f"",
             f"**Pattern:** {f.get('pattern', '?')}",
             f"**Location:** `{f.get('location', '?')}`",
@@ -1195,27 +1334,12 @@ def stage_report(deduped_findings: list[dict], repo_path: str, live_context: str
                     f"{v.get('validation_state')} · `{v.get('location')}` · sink: "
                     f"{(v.get('sink') or 'n/a')[:160]}"
                 )
+                if v.get("severity_caveat"):
+                    md_lines.append(v["severity_caveat"])
             md_lines.append("")
     
     md_path.write_text("\n".join(md_lines))
     
-    print(f"  ✓ JSON report: {report_path}")
-    print(f"  ✓ Markdown report: {md_path}")
-
-    if mismatches:
-        print("  ⚠ FUNNEL MISMATCH — stage counts do not reconcile:")
-        for problem in mismatches:
-            print(f"      {problem}")
-    elif "hunt_emitted" in accounting:
-        print(f"  ✓ Funnel reconciles: hunt {accounting.get('hunt_emitted')} + gapfill "
-              f"{accounting.get('gapfill_emitted', 0)} = "
-              f"excluded {len(accounting.get('excluded_by_confidence', []))} + "
-              f"validated {accounting.get('sent_to_validate')}; "
-              f"carried {accounting.get('carried_forward')} = "
-              f"reported {accounting.get('reported')} + "
-              f"collapsed {accounting.get('collapsed_into_variants')}")
-    if failed:
-        print(f"  ⚠ COVERAGE INCOMPLETE — {failed} of {planned} patterns produced no hunt result")
 
 
 # ── Batch Execution ──────────────────────────────────────────────────────────

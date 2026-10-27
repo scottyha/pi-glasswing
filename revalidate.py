@@ -5,6 +5,7 @@ Uses the fixed fail-closed semantics from matter d2f44257 (a242c7b): a validator
 could not speak produces an UNVALIDATED verdict, never an implicit uphold.
 """
 
+import argparse
 import json
 import re
 import sys
@@ -34,7 +35,99 @@ def failed_ids_from_log():
     return ids
 
 
+def original_failure_breakdown(expected_ids: set[str]) -> tuple[int, int, int] | None:
+    """Read the original validation stage, not fresh checkpoint verdicts."""
+    try:
+        log = RUN_LOG.read_text()
+    except (OSError, UnicodeError):
+        return None
+    start = log.find("═══ STAGE 3: VALIDATE")
+    end = log.find("═══ STAGE 4", start)
+    if start < 0 or end < 0:
+        return None
+    stage = log[start:end]
+    deadline = len(re.findall(r"^  ✗ Timeout: \S+", stage, re.M))
+    tail = len(re.findall(r"^  ✗ Timeout \(batch\): \S+", stage, re.M))
+    other = len(re.findall(r"^  ✗ Failed \(exit [^)]+\): \S+", stage, re.M))
+    errors = re.findall(r"^\s*⚠ ERROR: (\S+) — (.+)$", stage, re.M)
+    # Do not present partial or unrelated log data as an exact breakdown.
+    if (len(errors) != len(expected_ids) or {fid for fid, _ in errors} != expected_ids
+            or deadline + tail + other != len(errors)
+            or sum(reason.strip() == "timeout" for _, reason in errors) != deadline + tail):
+        return None
+    return deadline, tail, other
+
+
+def rebuild_artifacts(path: Path, report: dict | None = None) -> dict:
+    """Offline and idempotent: no session execution and no clock-dependent output."""
+    if report is None:
+        report = json.loads(path.read_text())
+    original = json.loads(REPORT_JSON.read_text())
+    state_path = Path(harness.RESULTS_DIR) / "revalidate-state.json"
+    verdicts = json.loads(state_path.read_text())["verdicts"]
+    original_by_id = {f["id"]: f for f in original["findings"]}
+    revalidated = set(verdicts) & original_by_id.keys()
+    retained = {f["id"] for f in report["findings"]}
+    removed = {fid for fid in revalidated if fid not in retained
+               and verdicts[fid].get("rejected") and not verdicts[fid].get("failed")}
+    breakdown = original_failure_breakdown(revalidated)
+    if breakdown is None:
+        detail = ("timeout/other numeric breakdown unavailable: original run log is "
+                  "absent or unparseable.")
+    else:
+        deadline, tail, other = breakdown
+        detail = (f"{deadline} timed out after the full {harness.PI_TIMEOUT}s session budget "
+                  f"(the log does not record the cause; timeout records discard output). "
+                  f"{tail} were batch-tail kills: once one session in a batch hit "
+                  f"{harness.PI_TIMEOUT}s, harness.py::run_batch found 0s remaining for every "
+                  f"later slot in that batch and killed them without reading their output. "
+                  f"{other} failed for any other reason.")
+    report["revalidation_note"] = (
+        f"Revalidated {len(revalidated)} findings that failed validation in the original run. "
+        f"{detail} "
+        f"{len(removed)} of the revalidated were disproved on the fresh attempt and removed."
+    )
+    for finding in report["findings"]:
+        # Repair effects of the earlier overbroad template cap from original evidence.
+        if finding.get("severity_caveat", "").startswith("⚠ Severity capped at HIGH:"):
+            baseline = original_by_id[finding["id"]]
+            finding["severity"] = baseline["severity"]
+            finding["confidence"] = baseline["confidence"]
+            finding.pop("severity_caveat")
+        finding.setdefault("validation_state", "validated" if finding.get("validated")
+                           else "unvalidated")
+        harness.apply_template_severity_cap(finding)
+    summary = report["summary"]
+    summary.update(total_findings=len(report["findings"]),
+                   validated=sum(bool(f.get("validated")) for f in report["findings"]),
+                   unvalidated=sum(not f.get("validated") for f in report["findings"]),
+                   revalidated_rejected=len(removed))
+    for field, key in (("by_severity", "severity"), ("by_pattern", "pattern"),
+                       ("by_layer", "layer")):
+        counts = {}
+        for finding in report["findings"]:
+            value = finding.get(key, "UNKNOWN" if key == "severity" else "unknown")
+            if key == "layer":
+                value = harness.PATTERNS.get(finding.get("pattern"), {}).get("layer", value)
+            counts[value] = counts.get(value, 0) + 1
+        summary[field] = counts
+    live_context = (Path(harness.RESULTS_DIR) / "live-context-20261026-123919.md").read_text()
+    harness.write_report_markdown(report, path.with_suffix(".md"), live_context)
+    path.write_text(json.dumps(report, indent=2))
+    print(f"Rebuilt {path.name}: {summary['total_findings']} findings")
+    print(report["revalidation_note"])
+    return report
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rebuild-artifacts", nargs="+", type=Path,
+                        help="rebuild existing JSON/Markdown artifacts without LLM calls")
+    args = parser.parse_args()
+    if args.rebuild_artifacts:
+        for path in args.rebuild_artifacts:
+            rebuild_artifacts(path)
+        return
     report = json.loads(REPORT_JSON.read_text())
     failed = failed_ids_from_log()
     print(f"failed validations from log: {len(failed)}")
@@ -56,7 +149,6 @@ def main():
         return
     print(f"revalidating {len(items)} findings with {harness.VALIDATOR_MODEL} (batches of 4)")
 
-    from pathlib import Path as _P
     state_path = Path(harness.RESULTS_DIR) / "revalidate-state.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {"verdicts": {}}
     verdicts = state["verdicts"]
@@ -95,63 +187,10 @@ def main():
         else:
             finding["validated"] = True
             finding["validation_state"] = "validated"
-    now = datetime.now()
-    sev_counts = {}
-    pat_counts = {}
-    for f in report["findings"]:
-        s = f.get("severity", "UNKNOWN")
-        sev_counts[s] = sev_counts.get(s, 0) + 1
-        p = f.get("pattern", "unknown")
-        pat_counts[p] = pat_counts.get(p, 0) + 1
-    report["summary"]["validated"] = sum(1 for f in report["findings"] if f.get("validated"))
-    report["summary"]["unvalidated"] = sum(1 for f in report["findings"] if not f.get("validated"))
-    report["summary"]["revalidated_rejected"] = len(removed)
-    report["summary"]["total_findings"] = len(report["findings"])
-    report["summary"]["by_severity"] = sev_counts
-    report["summary"]["by_pattern"] = pat_counts
-    report["revalidation_note"] = (
-        f"Revalidated {len(items)} findings whose validators timed out (DeepSeek balance outage "
-        f"mid-run). Fixed fail-closed semantics applied. {len(removed)} of the revalidated were "
-        f"disproved on the fresh attempt and removed."
-    )
-
-    stamp = now.strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     corr_json = Path(harness.RESULTS_DIR) / f"report-{stamp}-revalidated.json"
-    corr_md = Path(harness.RESULTS_DIR) / f"report-{stamp}-revalidated.md"
-    corr_json.write_text(json.dumps(report, indent=2))
-
-    # Corrected markdown: regenerate summary header from the original, keep body
-    orig_md = Path(harness.RESULTS_DIR) / "report-20261026-153259.md"
-    md_text = orig_md.read_text()
-    header = (
-        f"# Vulnerability Assessment Report (REVALIDATED)\n\n"
-        f"**Repository:** `/home/mom/projects/rpl-it-website`\n"
-        f"**Date:** {now.strftime('%Y-%m-%d %H:%M')}\n"
-        f"**Findings:** {len(report['findings'])} (validated: {report['summary']['validated']}, unvalidated: {report['summary']['unvalidated']})\n\n"
-        + "".join(f"- **{s.upper()}:** {c}\n" for s, c in report["summary"]["by_severity"].items() if s != "UNKNOWN")
-        + f"\n*Original run lost DeepSeek balance mid-validation; 27 validators timed out and the "
-        f"pre-fix harness logged them as validated. This corrected report re-ran those "
-        f"validators under fail-closed semantics: {len(removed)} were subsequently DISPROVED "
-        f"and removed; the rest are marked unvalidated or validated accordingly. "
-        f"Original: report-20261026-153259.*\n\n"
-        f"## Summary\n\n"
-    )
-    body_start = md_text.find("## Summary")
-    # keep the original body after its summary section header block (severity bullets + intel)
-    rest = md_text[body_start:]
-    # drop the original severity bullet block to avoid stale counts
-    lines = rest.split("\n")
-    # find first non-bullet content after "## Summary"
-    drop_to = 2
-    in_bullets = True
-    for i, l in enumerate(lines[2:], start=2):
-        if in_bullets and (l.startswith("- **") or l.strip() == ""):
-            continue
-        else:
-            drop_to = i
-            in_bullets = False
-            break
-    corr_md.write_text(header + "\n".join(lines[drop_to:]))
+    corr_md = corr_json.with_suffix(".md")
+    report = rebuild_artifacts(corr_json, report)
     print(f"\ncorrected report: {corr_md.name} / {corr_json.name}")
     print(f"summary: {report['summary']['total_findings']} findings "
           f"({report['summary']['validated']} validated, {report['summary']['unvalidated']} unvalidated, "

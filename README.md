@@ -104,6 +104,34 @@ All free, no signup required:
 | `--no-gapfill` | Skip gapfill re-queue pass |
 | `--list-patterns` | List all attack patterns and exit |
 
+## Offline report rebuilds
+
+`python3 revalidate.py --rebuild-artifacts results/report-…-revalidated.json` only
+reads saved evidence and renders reports; it does not run sessions or harvest intel.
+Back up both JSON and Markdown before rebuilding. Generated `results/` files stay
+on disk and are not version-controlled.
+
+The run-1 rebuild needs the original `report-20261026-153259.json`,
+`revalidate-state.json`, and `live-context-20261026-123919.md` in `results/`.
+It reads `RUN_LOG` for the original timeout split, falling back to an explicit
+unavailable-breakdown note if that log is absent or cannot be reconciled. Legacy
+`validated` flags supply missing validation states. Earlier template-cap effects
+are restored from the original report before the corrected cap is applied.
+
+Glasswing applies a **deterministic post-validation severity/confidence cap**
+(`CRITICAL`→`HIGH`, `CONFIRMED`→`SUSPECTED`) to template-only runtime-configuration
+claims instead of a mandatory "verify against the deployed value" step, because a
+static repo session cannot read the deployed environment. The cap does not verify
+deployment; it ceilings claims that cannot be verified from the repo. It changes
+only CRITICAL claims with template config references and no non-template config
+references. Code paths alone do not establish runtime values. `secrets-in-source` and `origin-ip-exposed` are exempt because a
+committed template can itself prove repository disclosure. Non-CRITICAL findings
+are untouched. Missing funnel accounting is explicitly reported as unknown
+coverage/reconciliation, not reconstructed from incomplete evidence or presented
+as a complete assessment. Dependency intel is rendered from the saved live brief.
+
+Offline regression checks: `python3 test_funnel.py` (stdlib assertions, no LLM calls).
+
 ## Project Structure
 
 ```

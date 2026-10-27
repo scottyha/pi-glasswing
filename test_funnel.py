@@ -11,6 +11,8 @@ produced from a persisted hunt artefact and a run log, then asserts the funnel
 reconciles and that no carried-forward finding disappears from the report.
 """
 
+import contextlib
+import io
 import json
 import re
 import shutil
@@ -20,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness as H  # noqa: E402
+import revalidate as R  # noqa: E402
 
 
 def _finding(fid, sink, severity="HIGH", validated=True, confidence="CONFIRMED"):
@@ -59,6 +62,22 @@ def check_dedupe():
     assert merged["variant_details"][0]["location"]
     assert (acc["carried_forward"], acc["reported"], acc["collapsed_into_variants"]) == (3, 2, 1)
     assert "is_root_cause" not in merged, "the constant field is gone"
+
+
+def check_dedupe_template_exemptions():
+    hunt = [{"pattern_id": pattern, "findings": [{
+        "id": f"F-{pattern}-001", "severity": "CRITICAL", "confidence": "CONFIRMED",
+        "location": ".env.example:1", "sink": "runtime setting",
+    }]} for pattern in ("secrets-in-source", "sensitive-files")]
+    before = json.dumps(hunt)
+    rows = {row["pattern"]: row for row in H.stage_dedupe(hunt, [])}
+    assert rows["secrets-in-source"]["severity"] == "CRITICAL"
+    assert rows["secrets-in-source"]["confidence"] == "CONFIRMED"
+    assert "severity_caveat" not in rows["secrets-in-source"]
+    assert rows["sensitive-files"]["severity"] == "HIGH"
+    assert rows["sensitive-files"]["confidence"] == "SUSPECTED"
+    assert rows["sensitive-files"]["severity_caveat"]
+    assert json.dumps(hunt) == before, "dedupe must not mutate raw hunter evidence"
 
 
 def check_primary_prefers_adjudicated():
@@ -109,6 +128,141 @@ def check_report_paths():
     finally:
         shutil.rmtree(H.RESULTS_DIR, ignore_errors=True)
         H.RESULTS_DIR = original
+
+
+def check_config_refs():
+    templates = [".env.example", ".env.production.example", "config.example.json",
+                 "docker-compose.example.yml", "settings.template.yaml", "wrangler.example.toml",
+                 ".env.sample", ".env.dist", ".env.default", ".env.defaults", "x.sample.ini",
+                 "x.dist.cfg", "x.default.conf", "x.defaults.conf"]
+    configs = [".env", ".env.local", "docker-compose.yml", "config.json", "settings.yaml",
+               "wrangler.toml", "x.ini", "x.cfg", "x.conf",
+               "/etc/nginx/conf.d/default.conf", "config/default.json"]
+    ignored = ["sampler.sample", "a.b.example", "views/invoice.template", "x.template.ts",
+               "README.example.json", "README.env", "docs/.env.example", "tests/config.json",
+               "fixtures/x.template.yaml", "__fixtures__/.env", "test/.env", "doc/.env",
+               "http://evil.example:8080", "https://evil.example/config.example.json",
+               "//evil.example/config.json", r"C:\docs\.env.example", ".env.example/",
+               "config.example.json/", "", "src/a.ts", "x.py", "x.env", "x.defaults.env",
+               "process.env", "import.meta.env", "os.environ", "{...process.env",
+               "res.json({...})", "req.json()", "NextResponse.json({...})"]
+    assert H.normalize_ref(r"C:\docs\.env.example/") == "C:/docs/.env.example"
+    print("    PASS normalize Windows path/trailing slash")
+    for ref in ("", "/", "//host/.env", "http://host/.env", r"\\host\.env"):
+        assert H.normalize_ref(ref) is None, ref
+        print(f"    PASS normalize {ref!r}: None")
+    for ref in templates + configs:
+        assert H.is_config_file(ref), ref
+    for ref in templates + configs + ignored:
+        assert H.is_template_path(ref) == (ref in templates), ref
+        expected = ([ref], []) if ref in templates else ([], [ref]) if ref in configs else ([], [])
+        for field in ("location", "source", "sink", "attack_scenario"):
+            for suffix in ("", ":123", ":105-123", ":", ":10:20", ":10-12:20:"):
+                for text in (ref + suffix, f"UPLOAD_DIR in `{ref}{suffix}` points to a value."):
+                    assert H.extract_config_refs({field: text}) == expected, (field, text)
+        print(f"    PASS {ref!r}: templates={expected[0]}, configs={expected[1]} "
+              "(4 fields × 6 suffixes × bare/quoted)")
+    for text, expected in (
+        (".env.example:", ([".env.example"], [])),
+        (".env.example:10:20", ([".env.example"], [])),
+        ("src/config.example.json:10:20", (["src/config.example.json"], [])),
+        ("{[(`.env.example:10:20`)]}", ([".env.example"], [])),
+        ("res.json ({...})", ([], [])),
+        ("req.json() + .env.example:", ([".env.example"], [])),
+        ("process.env + .env.example:", ([".env.example"], [])),
+        ("/etc/nginx/conf.d/default.conf", ([], ["/etc/nginx/conf.d/default.conf"])),
+        ("config/default.json", ([], ["config/default.json"])),
+    ):
+        assert H.extract_config_refs({"location": text}) == expected, text
+        print(f"    PASS {text!r}: templates={expected[0]}, configs={expected[1]}")
+    for call in ("res.json({...})", "req.json()", "NextResponse.json({...})"):
+        assert not H.is_config_file(call), call
+    assert H.extract_config_refs({"location": r"C:\app\.env.example:8"}) == (
+        ["C:/app/.env.example"], [])
+    assert H.extract_config_refs({"location": ".env.example:8 + .env.local:9"}) == (
+        [".env.example"], [".env.local"])
+    assert H.extract_config_refs({"evidence": ".env.example"}) == ([], [])
+    print("    PASS Windows line-qualified runtime path: templates=['C:/app/.env.example']")
+    print("    PASS mixed refs: templates=['.env.example'], configs=['.env.local']")
+    print("    PASS evidence field ignored: templates=[], configs=[]")
+
+
+def check_template_cap():
+    finding = _finding("F-demo-001", "s", severity="CRITICAL")
+    finding["location"] = ".env.example"
+    H.apply_template_severity_cap(finding)
+    assert finding["severity"] == "HIGH" and finding["confidence"] == "SUSPECTED"
+    assert "not verified against the deployed configuration" in finding["severity_caveat"]
+    before = json.dumps(finding)
+    with contextlib.redirect_stdout(io.StringIO()) as output:
+        assert H.apply_template_severity_cap(finding) is finding
+    assert json.dumps(finding) == before and output.getvalue() == ""
+    for severity in ("LOW", "MEDIUM", "HIGH", "UNKNOWN"):
+        for pattern in ("demo", "secrets-in-source", "origin-ip-exposed"):
+            row = dict(finding, severity=severity, pattern=pattern, confidence="CONFIRMED")
+            row.pop("severity_caveat")
+            before = json.dumps(row)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                H.apply_template_severity_cap(row)
+            assert json.dumps(row) == before and output.getvalue() == ""
+    for pattern in H.TEMPLATE_CAP_EXEMPT_PATTERNS:
+        row = dict(finding, severity="CRITICAL", pattern=pattern, confidence="CONFIRMED")
+        row.pop("severity_caveat")
+        before = json.dumps(row)
+        H.apply_template_severity_cap(row)
+        assert json.dumps(row) == before
+    for location in (".env.example + .env.local", "x.ts:1 + y.py:3"):
+        row = dict(finding, severity="CRITICAL", location=location)
+        row.pop("severity_caveat")
+        before = json.dumps(row)
+        H.apply_template_severity_cap(row)
+        assert json.dumps(row) == before
+
+
+def check_offline_rebuild():
+    """Legacy flags, cap repair, missing accounting and live intel all survive rebuild."""
+    old_results, old_original, old_log = H.RESULTS_DIR, R.REPORT_JSON, R.RUN_LOG
+    try:
+        with tempfile.TemporaryDirectory(prefix="rebuild-") as tmp:
+            H.RESULTS_DIR = Path(tmp)
+            R.REPORT_JSON = Path(tmp) / "original.json"
+            R.RUN_LOG = Path(tmp) / "missing.log"
+            rows = [_finding("F-demo-001", "s"), _finding("F-demo-002", "s", validated=False)]
+            for row in rows:
+                row.pop("validation_state")
+            report = {"repository": ".", "generated_at": "2026-10-26T00:00:00",
+                      "summary": {}, "findings": rows}
+            R.REPORT_JSON.write_text(json.dumps(report))
+            # Simulate the old cap changing a non-CRITICAL finding.
+            rows[0]["confidence"] = "SUSPECTED"
+            rows[0]["severity_caveat"] = "⚠ Severity capped at HIGH: legacy cap"
+            (Path(tmp) / "revalidate-state.json").write_text('{"verdicts": {}}')
+            (Path(tmp) / "live-context-20261026-123919.md").write_text(
+                "## Dependency evidence\nRecorded advisory\n")
+            out = Path(tmp) / "rebuilt.json"
+            out.write_text(json.dumps(report))
+            R.rebuild_artifacts(out)
+            rebuilt = json.loads(out.read_text())
+            assert [f["validation_state"] for f in rebuilt["findings"]] == ["validated", "unvalidated"]
+            assert "breakdown unavailable" in rebuilt["revalidation_note"]
+            assert rebuilt["findings"][0]["confidence"] == "CONFIRMED"
+            assert "severity_caveat" not in rebuilt["findings"][0]
+            md = out.with_suffix(".md").read_text()
+            assert "No funnel accounting was recorded" in md and "FUNNEL MISMATCH" not in md
+            assert "## Known Vulnerabilities in Dependencies" in md and "Recorded advisory" in md
+            before = (out.read_bytes(), out.with_suffix(".md").read_bytes())
+            R.rebuild_artifacts(out)
+            assert before == (out.read_bytes(), out.with_suffix(".md").read_bytes())
+            R.RUN_LOG.write_text("═══ STAGE 3: VALIDATE\n  ✗ Timeout: demo\n"
+                                 "  ✗ Timeout (batch): demo\n"
+                                 "    ⚠ ERROR: A — timeout\n    ⚠ ERROR: B — timeout\n"
+                                 "═══ STAGE 4\n")
+            assert R.original_failure_breakdown({"A", "B"}) == (1, 1, 0)
+            assert R.original_failure_breakdown({"A"}) is None
+            R.RUN_LOG.write_text("malformed")
+            assert R.original_failure_breakdown({"A", "B"}) is None
+    finally:
+        H.RESULTS_DIR, R.REPORT_JSON, R.RUN_LOG = old_results, old_original, old_log
 
 
 def replay(hunt_path, log_path):
@@ -202,8 +356,10 @@ def replay(hunt_path, log_path):
 
 
 def main():
-    for check in (check_ids, check_dedupe, check_primary_prefers_adjudicated,
-                  check_reconcile, check_report_paths):
+    for check in (check_ids, check_dedupe, check_dedupe_template_exemptions,
+                  check_primary_prefers_adjudicated,
+                  check_reconcile, check_report_paths, check_config_refs,
+                  check_template_cap, check_offline_rebuild):
         check()
         print(f"  ✓ {check.__name__}")
     if len(sys.argv) == 3:

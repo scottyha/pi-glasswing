@@ -159,6 +159,8 @@ grep -rn "server_tokens" /etc/nginx/ 2>/dev/null
 
 ### Pattern: Sensitive Files Accessible
 
+**Template-only evidence:** For claims about deployed runtime configuration, if the only configuration references are committed templates (such as `.env.example` or `config.example.json`), downgrade CRITICAL to HIGH, limit confidence to SUSPECTED, and state that the value is not verified against deployed configuration. Leave HIGH, MEDIUM, and LOW findings unchanged. Do not apply this cap to secrets-in-source or origin-ip-exposed: committed material proves repository disclosure regardless of deployment.
+
 **What to search for:**
 ```bash
 # Test for common sensitive file exposure
