@@ -107,6 +107,13 @@ PATTERNS = {
     "etl-sql-assembly":         {"layer": "postgres",     "name": "Import/ETL SQL Assembly from Documents"},
 }
 
+# Registry display names can differ from corpus headings. The corpus is append-only;
+# reconcile those differences here without editing prose. Add future exceptions by id.
+PATTERN_SECTION_OVERRIDES = {
+    "secrets-in-source": "Secrets in Source",
+    "etl-sql-assembly": "Import and ETL SQL Assembly from Documents",
+}
+
 # Layer → skill pattern file mapping
 LAYER_FILES = {
     "nextjs":      SKILL_DIR / "patterns-nextjs.md",
@@ -406,7 +413,7 @@ def stage_hunt(repo_path: str, recon_doc: str, patterns: list[str] = None,
         
         # Extract just the relevant pattern section from the layer file
         full_layer = layer_knowledge_cache.get(layer, "")
-        pattern_section = extract_pattern_section(full_layer, pinfo["name"])
+        pattern_section = extract_pattern_section(full_layer, pid)
         
         # WooYun supplementary knowledge (excerpt only — these files are huge)
         wooyun_knowledge = ""
@@ -547,7 +554,7 @@ def stage_gapfill(repo_path: str, recon_doc: str, hunt_results: list[dict],
             layer_knowledge_cache[layer] = layer_file.read_text() if layer_file.exists() else ""
         
         full_layer = layer_knowledge_cache.get(layer, "")
-        pattern_section = extract_pattern_section(full_layer, pinfo["name"])
+        pattern_section = extract_pattern_section(full_layer, pid)
         
         # WooYun knowledge
         wooyun_knowledge = ""
@@ -1456,20 +1463,66 @@ def run_batch(items: list[dict], batch_size: int = BATCH_SIZE,
 
 # ── Utility Functions ─────────────────────────────────────────────────────────
 
-def extract_pattern_section(full_text: str, pattern_name: str) -> str:
-    """Extract just the relevant pattern section from a layer patterns file."""
-    if not full_text:
-        return ""
-    marker = f"### Pattern: {pattern_name}"
-    idx = full_text.find(marker)
-    if idx == -1:
-        print(f"  ⚠ WARNING: Pattern '{pattern_name}' not found in knowledge file. Using full layer context.")
-        return full_text  # fallback
-    
-    next_marker = full_text.find("\n### Pattern: ", idx + len(marker))
-    if next_marker == -1:
-        return full_text[idx:]
-    return full_text[idx:next_marker]
+PATTERN_SECTION_RE = re.compile(r"^### Pattern: ([^\r\n]+)\r?$", re.MULTILINE)
+
+
+def resolve_pattern_heading(pid: str) -> str:
+    """Resolve a registry id to its exact corpus heading (not its prompt title)."""
+    return PATTERN_SECTION_OVERRIDES.get(pid, PATTERNS[pid]["name"])
+
+
+def extract_pattern_section(full_text: str, pid: str) -> str:
+    """Extract exactly one section by registry id; never substitute layer context."""
+    heading = resolve_pattern_heading(pid)
+    layer_file = LAYER_FILES[PATTERNS[pid]["layer"]]
+    headings = list(PATTERN_SECTION_RE.finditer(full_text))
+    matches = [i for i, match in enumerate(headings) if match.group(1) == heading]
+    problem = f"Pattern '{pid}', expected heading '### Pattern: {heading}' in {layer_file}"
+    if len(matches) != 1:
+        raise ValueError(f"{problem}: found {len(matches)} headings, expected exactly one")
+
+    index = matches[0]
+    start = headings[index]
+    end = headings[index + 1].start() if index + 1 < len(headings) else len(full_text)
+    section = full_text[start.start():end]
+    if not full_text[start.end():end].strip() or len(section) >= len(full_text):
+        raise ValueError(f"{problem}: section is empty or is the full layer file")
+    return section
+
+
+def validate_pattern_sections() -> None:
+    """Require a bijection between registry ids and non-empty corpus sections."""
+    problems = []
+    layers = {}
+    claims = {}
+    for layer, layer_file in LAYER_FILES.items():
+        try:
+            layers[layer] = layer_file.read_text()
+        except (OSError, UnicodeError) as exc:
+            problems.append(f"Cannot read layer file {layer_file}: {exc}")
+
+    for pid, pinfo in PATTERNS.items():
+        layer = pinfo["layer"]
+        heading = resolve_pattern_heading(pid)
+        claims.setdefault((layer, heading), []).append(pid)
+        if layer not in LAYER_FILES:
+            problems.append(f"Pattern '{pid}' references unknown layer '{layer}'")
+        elif layer in layers:
+            try:
+                extract_pattern_section(layers[layer], pid)
+            except ValueError as exc:
+                problems.append(str(exc))
+
+    for (layer, heading), pids in claims.items():
+        if len(pids) > 1:
+            problems.append(f"Heading '{heading}' in layer '{layer}' claimed by {pids}")
+    for layer, full_text in layers.items():
+        for match in PATTERN_SECTION_RE.finditer(full_text):
+            if (layer, match.group(1)) not in claims:
+                problems.append(f"Orphan heading '{match.group(1)}' in {LAYER_FILES[layer]}")
+
+    if problems:
+        raise ValueError("Pattern section validation failed:\n" + "\n".join(problems))
 
 
 def parse_findings(output: str, pattern_id: str) -> list[dict]:
@@ -1532,6 +1585,7 @@ def main():
                         help="Skip gapfill stage (re-queue empty patterns with narrowed scope)")
     
     args = parser.parse_args()
+    validate_pattern_sections()
     
     # List patterns (no repo needed)
     if args.list_patterns:

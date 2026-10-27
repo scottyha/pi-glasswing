@@ -34,6 +34,72 @@ def _finding(fid, sink, severity="HIGH", validated=True, confidence="CONFIRMED")
     }
 
 
+def check_pattern_sections():
+    H.validate_pattern_sections()
+    assert len(H.PATTERNS) == 48
+    claims = set()
+    for pid, pinfo in H.PATTERNS.items():
+        layer = pinfo["layer"]
+        full_text = H.LAYER_FILES[layer].read_text()
+        heading = H.resolve_pattern_heading(pid)
+        headings = re.findall(r"^### Pattern: (.+)$", full_text, re.MULTILINE)
+        assert headings.count(heading) == 1, pid
+        key = (layer, heading)
+        assert key not in claims, key
+        claims.add(key)
+        section = H.extract_pattern_section(full_text, pid)
+        assert 0 < len(section) < len(full_text), pid
+        assert re.findall(r"^### Pattern: (.+)$", section, re.MULTILINE) == [heading], pid
+        assert section.split("\n", 1)[1].strip(), pid
+
+    corpus = [(layer, heading) for layer, path in H.LAYER_FILES.items()
+              for heading in re.findall(r"^### Pattern: (.+)$", path.read_text(), re.MULTILINE)]
+    assert len(corpus) == len(claims) == 48
+    assert set(corpus) == claims, "no orphan headings"
+
+    pid = "secrets-in-source"
+    heading = H.resolve_pattern_heading(pid)
+    path = H.LAYER_FILES[H.PATTERNS[pid]["layer"]]
+    full_text = path.read_text()
+    marker = f"### Pattern: {heading}"
+    # Exact whole-line matching, duplicate rejection, empty input/body, no full-file fallback.
+    for broken in (full_text.replace(marker, marker + " bogus"),
+                   full_text + f"\n{marker}\nDuplicate body\n", "",
+                   f"Preamble\n{marker}\n", f"{marker}\nOnly section\n"):
+        try:
+            H.extract_pattern_section(broken, pid)
+        except ValueError as exc:
+            assert pid in str(exc) and marker in str(exc) and str(path) in str(exc)
+        else:
+            raise AssertionError("invalid section must raise, never return full layer context")
+
+    # Validation collects all failures rather than stopping at the first broken layer.
+    original_files = H.LAYER_FILES
+    original_overrides = H.PATTERN_SECTION_OVERRIDES
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            H.LAYER_FILES = {layer: Path(tmp) / path.name
+                             for layer, path in original_files.items()}
+            for layer, path in original_files.items():
+                if layer != "nextjs":
+                    H.LAYER_FILES[layer].write_text(path.read_text())
+            H.LAYER_FILES["infra"].write_text(full_text + "\n### Pattern: Orphan test\nBody\n")
+            H.PATTERN_SECTION_OVERRIDES = dict(original_overrides,
+                                              **{"weak-csp": "Missing Security Headers"})
+            try:
+                H.validate_pattern_sections()
+            except ValueError as exc:
+                report = str(exc)
+                assert "Cannot read layer file" in report
+                assert "Orphan test" in report and "Weak Content-Security-Policy" in report
+                assert "claimed by" in report
+            else:
+                raise AssertionError("broken corpus must fail startup validation")
+    finally:
+        H.LAYER_FILES = original_files
+        H.PATTERN_SECTION_OVERRIDES = original_overrides
+
+
 def check_ids():
     hunt = [{"pattern_id": "demo", "findings": [
         {"id": "F-demo-001", "confidence": "SUSPECTED", "sink": "a", "severity": "LOW"},
@@ -356,7 +422,7 @@ def replay(hunt_path, log_path):
 
 
 def main():
-    for check in (check_ids, check_dedupe, check_dedupe_template_exemptions,
+    for check in (check_pattern_sections, check_ids, check_dedupe, check_dedupe_template_exemptions,
                   check_primary_prefers_adjudicated,
                   check_reconcile, check_report_paths, check_config_refs,
                   check_template_cap, check_offline_rebuild):
