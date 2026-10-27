@@ -1508,7 +1508,8 @@ def run_batch(items: list[dict], batch_size: int = BATCH_SIZE,
 
     diagnostics = [{key: result.get(key) for key in (
         "pattern_id", "finding_id", "error", "elapsed_s", "last_event",
-        "partial_stdout", "partial_stderr", "harvest_truncated")}
+        "partial_stdout", "partial_stderr", "harvest_truncated", "output")
+        if key != "output" or result.get(key)}
         for result in results if result.get("error") in ("timeout-session", "timeout-batch-tail")]
     if diagnostics:
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)

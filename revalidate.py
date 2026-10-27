@@ -29,7 +29,7 @@ def failed_ids_from_log():
         elif line.startswith("═══ STAGE 4"):
             break
         if validation_started:
-            m = re.match(r"\s*⚠ ERROR: (\S+) —", line)
+            m = re.match(r"\s*⚠ (?:ERROR|UNVALIDATED): (\S+) —", line)
             if m:
                 ids.add(m.group(1))
     return ids
@@ -49,7 +49,7 @@ def original_failure_breakdown(expected_ids: set[str]) -> tuple[int, int, int] |
     deadline = len(re.findall(r"^  ✗ (?:Timeout|timeout|timeout-session): \S+", stage, re.M))
     tail = len(re.findall(r"^  ✗ (?:Timeout \(batch\)|timeout-batch-tail): \S+", stage, re.M))
     other = len(re.findall(r"^  ✗ Failed \(exit [^)]+\): \S+", stage, re.M))
-    errors = re.findall(r"^\s*⚠ ERROR: (\S+) — (.+)$", stage, re.M)
+    errors = re.findall(r"^\s*⚠ (?:ERROR|UNVALIDATED): (\S+) — (.+)$", stage, re.M)
     # Do not present partial or unrelated log data as an exact breakdown.
     if (len(errors) != len(expected_ids) or {fid for fid, _ in errors} != expected_ids
             or deadline + tail + other != len(errors)

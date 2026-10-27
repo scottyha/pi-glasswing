@@ -66,12 +66,16 @@ def check_session_and_persistence():
         files = list(directory.glob("validate-*.json"))
         assert len(files) == 1
         persisted = json.loads(files[0].read_text())
+        assert persisted[0]["output"] == "[]", "recovered answer reaches diagnostics artifact"
         assert persisted[0]["partial_stdout"] == row["partial_stdout"]
         assert persisted[0]["finding_id"] == "F-0"
         assert "prompt" not in persisted[0] and "repo" not in persisted[0]
         # Same-second calls (including hunt without a finding_id) must not overwrite.
         run(["import time; time.sleep(10)"], directory, timeout=0.1, finding_ids=False)
-        assert len(list(directory.glob("validate-*.json"))) == 2
+        artifacts = list(directory.glob("validate-*.json"))
+        assert len(artifacts) == 2
+        unanswered = next(path for path in artifacts if path != files[0])
+        assert "output" not in json.loads(unanswered.read_text())[0]
         assert json.loads(files[0].read_text()) == persisted
 
 
@@ -136,11 +140,14 @@ def check_log_vocabulary():
             ("timeout-session", "timeout-batch-tail", ("timeout-session", "timeout-batch-tail")),
             ("timeout", "Timeout (batch)", ("timeout-session", "timeout-batch-tail")),
         ):
-            log.write_text(f"═══ STAGE 3: VALIDATE\n  ✗ {session}: demo\n"
-                           f"  ✗ {tail}: demo\n    ⚠ ERROR: A — {reasons[0]}\n"
-                           f"    ⚠ ERROR: B — {reasons[1]}\n═══ STAGE 4\n")
-            with patch.object(R, "RUN_LOG", log):
-                assert R.original_failure_breakdown({"A", "B"}) == (1, 1, 0)
+            for prefix_a, prefix_b in (("ERROR", "ERROR"), ("UNVALIDATED", "UNVALIDATED"),
+                                       ("ERROR", "UNVALIDATED"), ("UNVALIDATED", "ERROR")):
+                log.write_text(f"═══ STAGE 3: VALIDATE\n  ✗ {session}: demo\n"
+                               f"  ✗ {tail}: demo\n    ⚠ {prefix_a}: A — {reasons[0]}\n"
+                               f"    ⚠ {prefix_b}: B — {reasons[1]}\n═══ STAGE 4\n")
+                with patch.object(R, "RUN_LOG", log):
+                    assert R.failed_ids_from_log() == {"A", "B"}
+                    assert R.original_failure_breakdown({"A", "B"}) == (1, 1, 0)
 
 
 def main():
