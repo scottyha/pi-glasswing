@@ -46,14 +46,15 @@ def original_failure_breakdown(expected_ids: set[str]) -> tuple[int, int, int] |
     if start < 0 or end < 0:
         return None
     stage = log[start:end]
-    deadline = len(re.findall(r"^  ✗ Timeout: \S+", stage, re.M))
-    tail = len(re.findall(r"^  ✗ Timeout \(batch\): \S+", stage, re.M))
+    deadline = len(re.findall(r"^  ✗ (?:Timeout|timeout|timeout-session): \S+", stage, re.M))
+    tail = len(re.findall(r"^  ✗ (?:Timeout \(batch\)|timeout-batch-tail): \S+", stage, re.M))
     other = len(re.findall(r"^  ✗ Failed \(exit [^)]+\): \S+", stage, re.M))
     errors = re.findall(r"^\s*⚠ ERROR: (\S+) — (.+)$", stage, re.M)
     # Do not present partial or unrelated log data as an exact breakdown.
     if (len(errors) != len(expected_ids) or {fid for fid, _ in errors} != expected_ids
             or deadline + tail + other != len(errors)
-            or sum(reason.strip() == "timeout" for _, reason in errors) != deadline + tail):
+            or sum(reason.strip() in {"timeout", "timeout-session", "timeout-batch-tail"}
+                   for _, reason in errors) != deadline + tail):
         return None
     return deadline, tail, other
 

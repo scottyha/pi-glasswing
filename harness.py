@@ -41,6 +41,7 @@ RESULTS_DIR = Path(__file__).resolve().parent / "results"
 BATCH_SIZE = 8          # concurrent pi sessions
 PI_TIMEOUT = 600        # seconds per session (10 min)
 PI_MODE = "json"        # "print" for plain text, "json" for structured events
+KILL_GRACE = 10         # bounded pipe harvest; tool grandchildren may keep pipes open
 
 # Models + thinking — hunters can be cheaper/faster, validators should think deeper
 # deepseek-flash is a floating alias on the DeepSeek API: always the latest Flash (currently V4.1-Flash).
@@ -1354,6 +1355,74 @@ def run_batch(items: list[dict], batch_size: int = BATCH_SIZE,
     Uses --mode json for structured output.
     Default tools are read-only (read, grep, find, ls).
     """
+    def stream_text(value):
+        # TimeoutExpired carries bytes even when Popen uses text=True.
+        return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+
+    def parse_stream(stdout):
+        """Keep the final assistant answer and last complete JSONL event independently."""
+        answer = ""
+        last_event = "No parseable JSONL event"
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("type", "unknown"))
+            last_event = event_type
+            if "tool" in event_type:
+                tool = event.get("toolName", event.get("name", "unknown"))
+                args = event.get("args", event.get("arguments", {}))
+                primary = args
+                if isinstance(args, dict):
+                    primary = next((args[key] for key in ("path", "command", "pattern", "query", "url")
+                                    if key in args), next(iter(args.values()), ""))
+                last_event = f"{event_type}: {tool} {primary}"
+            last_event = " ".join(last_event.split())[:300]
+            if event_type == "agent_end":
+                for msg in reversed(event.get("messages", [])):
+                    if msg.get("role") == "assistant":
+                        content = msg.get("content", [])
+                        if isinstance(content, list):
+                            answer = "".join(block.get("text", "") for block in content
+                                             if isinstance(block, dict) and block.get("type") == "text")
+                        elif isinstance(content, str):
+                            answer = content
+                        break
+        return answer.strip(), last_event
+
+    def harvest(proc, earlier=None):
+        """Never wait indefinitely for a tool grandchild holding inherited pipes."""
+        try:
+            stdout, stderr = proc.communicate(timeout=KILL_GRACE)
+            return stdout, stderr, False
+        except subprocess.TimeoutExpired as exc:
+            # communicate retries retain the accumulated output, not just a new tail.
+            stdout = stream_text(exc.stdout if exc.stdout is not None else
+                                 getattr(earlier, "stdout", None))
+            stderr = stream_text(exc.stderr if exc.stderr is not None else
+                                 getattr(earlier, "stderr", None))
+            proc.poll()  # reap the direct child if it has exited
+            proc.stdout.close()
+            proc.stderr.close()
+            return stdout, stderr, True
+
+    def timeout_result(p, error, stdout, stderr, truncated):
+        answer, last_event = parse_stream(stdout)
+        elapsed = round(time.monotonic() - p["started"], 1)
+        result = {**p["meta"], "success": False, "error": error,
+                  "partial_stdout": stdout[-4000:], "partial_stderr": stderr[-2000:],
+                  "last_event": last_event, "elapsed_s": elapsed,
+                  "harvest_truncated": truncated}
+        if answer:
+            result["output"] = answer
+        results.append(result)
+        label = "Timeout (batch)" if error == "timeout-batch-tail" else "Timeout"
+        print(f"  ✗ {label}: {p['meta']['pattern_id']}")
+        print(f"    {elapsed:.1f}s — {last_event}")
+
     results = []
     total = len(items)
     _model = model or HUNTER_MODEL
@@ -1380,6 +1449,7 @@ def run_batch(items: list[dict], batch_size: int = BATCH_SIZE,
                 no_session=True,
                 no_context_files=False,  # keep AGENTS.md — it has project context
             )
+            started = time.monotonic()
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -1387,72 +1457,74 @@ def run_batch(items: list[dict], batch_size: int = BATCH_SIZE,
                 cwd=item["repo"],
                 text=True,
             )
-            processes.append({"proc": proc, "meta": item})
+            processes.append({"proc": proc, "meta": item, "started": started})
             print(f"  → Started: {item['pattern_id']}")
         
         # Wait for batch to complete
         # Track batch start time so timeouts don't accumulate across processes
-        batch_start = time.time()
+        batch_start = time.monotonic()
         for p in processes:
             pid = p["meta"]["pattern_id"]
-            remaining = max(0, PI_TIMEOUT - (time.time() - batch_start))
-            if remaining == 0:
-                # Batch timeout already exceeded — kill remaining processes
-                p["proc"].kill()
-                p["proc"].communicate()
-                results.append({**p["meta"], "success": False, "error": "timeout"})
-                print(f"  ✗ Timeout (batch): {pid}")
-                continue
-            try:
-                stdout, stderr = p["proc"].communicate(timeout=remaining)
-                
-                # Check exit code
-                if p["proc"].returncode != 0:
-                    results.append({**p["meta"], "success": False, 
-                                     "error": f"exit code {p['proc'].returncode}",
-                                     "stderr": stderr.strip()[:500]})
-                    print(f"  ✗ Failed (exit {p['proc'].returncode}): {pid}")
+            proc = p["proc"]
+            remaining = max(0, PI_TIMEOUT - (time.monotonic() - batch_start))
+            after_deadline = remaining == 0
+            if after_deadline:
+                # A completed tail slot must not be killed or lose its answer.
+                if proc.poll() is None:
+                    proc.kill()
+                    stdout, stderr, truncated = harvest(proc)
+                    timeout_result(p, "timeout-batch-tail", stdout, stderr, truncated)
                     continue
-                
-                # Parse JSONL events — extract text from the LAST assistant message only
-                last_assistant_text = ""
-                for line in stdout.strip().split("\n"):
-                    try:
-                        event = json.loads(line.strip())
-                        if event.get("type") == "agent_end":
-                            messages = event.get("messages", [])
-                            # Take only the last assistant message (the final answer)
-                            for msg in reversed(messages):
-                                if msg.get("role") == "assistant":
-                                    content = msg.get("content", [])
-                                    if isinstance(content, list):
-                                        last_assistant_text = "".join(
-                                            block.get("text", "") 
-                                            for block in content 
-                                            if isinstance(block, dict) and block.get("type") == "text"
-                                        )
-                                    elif isinstance(content, str):
-                                        last_assistant_text = content
-                                    break
-                    except json.JSONDecodeError:
-                        continue
-                
-    # If parsing fails, output is empty but success is True.
-                # In that case, keep success=True but we log a warning.
-                if p["proc"].returncode == 0 and not last_assistant_text.strip():
-                    print(f"  ⚠ Output parse warning (empty assistant msg): {pid}")
+                stdout, stderr, truncated = harvest(proc)
+                if truncated:
+                    timeout_result(p, "timeout-batch-tail", stdout, stderr, truncated)
+                    continue
+            else:
+                try:
+                    stdout, stderr = proc.communicate(timeout=remaining)
+                except subprocess.TimeoutExpired as exc:
+                    proc.kill()
+                    stdout, stderr, truncated = harvest(proc, exc)
+                    timeout_result(p, "timeout-session", stdout, stderr, truncated)
+                    continue
 
-                results.append({**p["meta"], "success": True, 
-                                 "output": last_assistant_text.strip(),
-                                 "stderr": stderr.strip()[:500]})
-                print(f"  ✓ Done: {pid}")
-                
-            except subprocess.TimeoutExpired:
-                p["proc"].kill()
-                p["proc"].communicate()  # reap the zombie
-                results.append({**p["meta"], "success": False, "error": "timeout"})
-                print(f"  ✗ Timeout: {pid}")
-    
+            elapsed = round(time.monotonic() - p["started"], 1)
+            if proc.returncode != 0:
+                results.append({**p["meta"], "success": False,
+                                "error": f"exit code {proc.returncode}",
+                                "stderr": stderr.strip()[:500], "elapsed_s": elapsed})
+                print(f"  ✗ Failed (exit {proc.returncode}): {pid}")
+                continue
+
+            answer, _ = parse_stream(stdout)
+            if not answer:
+                print(f"  ⚠ Output parse warning (empty assistant msg): {pid}")
+            result = {**p["meta"], "success": True, "output": answer,
+                      "stderr": stderr.strip()[:500], "elapsed_s": elapsed}
+            if after_deadline:
+                result["harvested_after_batch_deadline"] = True
+            results.append(result)
+            print(f"  ✓ Done: {pid}")
+
+    diagnostics = [{key: result.get(key) for key in (
+        "pattern_id", "finding_id", "error", "elapsed_s", "last_event",
+        "partial_stdout", "partial_stderr", "harvest_truncated")}
+        for result in results if result.get("error") in ("timeout-session", "timeout-batch-tail")]
+    if diagnostics:
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        # Hunt, gapfill and revalidation can call us within the same second.
+        # Reserve a timestamp name exclusively rather than overwrite earlier evidence.
+        offset = 0
+        while True:
+            stamp = datetime.fromtimestamp(time.time() + offset).strftime("%Y%m%d-%H%M%S")
+            path = RESULTS_DIR / f"validate-{stamp}.json"
+            try:
+                with path.open("x") as artifact:
+                    json.dump(diagnostics, artifact, indent=2)
+                break
+            except FileExistsError:
+                offset += 1
+        print(f"  Timeout diagnostics: {path}")
     return results
 
 
