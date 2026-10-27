@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness as H  # noqa: E402
@@ -36,26 +37,30 @@ def _finding(fid, sink, severity="HIGH", validated=True, confidence="CONFIRMED")
 
 def check_pattern_sections():
     H.validate_pattern_sections()
-    assert len(H.PATTERNS) == 48
     claims = set()
     for pid, pinfo in H.PATTERNS.items():
         layer = pinfo["layer"]
         full_text = H.LAYER_FILES[layer].read_text()
         heading = H.resolve_pattern_heading(pid)
-        headings = re.findall(r"^### Pattern: (.+)$", full_text, re.MULTILINE)
+        headings = H.PATTERN_SECTION_RE.findall(full_text)
         assert headings.count(heading) == 1, pid
         key = (layer, heading)
         assert key not in claims, key
         claims.add(key)
         section = H.extract_pattern_section(full_text, pid)
         assert 0 < len(section) < len(full_text), pid
-        assert re.findall(r"^### Pattern: (.+)$", section, re.MULTILINE) == [heading], pid
+        assert H.PATTERN_SECTION_RE.findall(section) == [heading], pid
+        assert not re.search(r"^## ", section, re.MULTILINE), pid
+        assert "## Quick Detection Commands" not in section, pid
+        assert section != full_text[full_text.index("### Pattern: "):], pid
         assert section.split("\n", 1)[1].strip(), pid
 
     corpus = [(layer, heading) for layer, path in H.LAYER_FILES.items()
-              for heading in re.findall(r"^### Pattern: (.+)$", path.read_text(), re.MULTILINE)]
-    assert len(corpus) == len(claims) == 48
+              for heading in H.PATTERN_SECTION_RE.findall(path.read_text())]
+    assert len(corpus) == len(claims) == len(H.PATTERNS)
     assert set(corpus) == claims, "no orphan headings"
+    print(f"    {len(claims)}/{len(H.PATTERNS)} resolve: one pattern heading, "
+          "zero level-2 headings, no full-layer body in every section")
 
     pid = "secrets-in-source"
     heading = H.resolve_pattern_heading(pid)
@@ -65,13 +70,22 @@ def check_pattern_sections():
     # Exact whole-line matching, duplicate rejection, empty input/body, no full-file fallback.
     for broken in (full_text.replace(marker, marker + " bogus"),
                    full_text + f"\n{marker}\nDuplicate body\n", "",
-                   f"Preamble\n{marker}\n", f"{marker}\nOnly section\n"):
+                   f"Preamble\n{marker}\n", f"Preamble\n{marker}\nOnly section\n"):
         try:
             H.extract_pattern_section(broken, pid)
         except ValueError as exc:
             assert pid in str(exc) and marker in str(exc) and str(path) in str(exc)
         else:
             raise AssertionError("invalid section must raise, never return full layer context")
+
+    # A prefix collision before the real heading must not select the wrong section.
+    collision = f"{marker} bogus\nWrong body\n" + full_text
+    assert H.extract_pattern_section(collision, pid) == H.extract_pattern_section(full_text, pid)
+    assert H.extract_pattern_section(full_text.replace("\n", "\r\n"), pid).replace(
+        "\r\n", "\n") == H.extract_pattern_section(full_text, pid)
+    for boundary in ("## Category", "### Pattern: Another"):
+        text = f"Preamble\n{marker}\nOwn body\n\n---\n\n{boundary}\nOther body\n"
+        assert H.extract_pattern_section(text, pid) == f"{marker}\nOwn body\n\n"
 
     # Validation collects all failures rather than stopping at the first broken layer.
     original_files = H.LAYER_FILES
@@ -81,11 +95,19 @@ def check_pattern_sections():
             H.LAYER_FILES = {layer: Path(tmp) / path.name
                              for layer, path in original_files.items()}
             for layer, path in original_files.items():
-                if layer != "nextjs":
-                    H.LAYER_FILES[layer].write_text(path.read_text())
-            H.LAYER_FILES["infra"].write_text(full_text + "\n### Pattern: Orphan test\nBody\n")
-            H.PATTERN_SECTION_OVERRIDES = dict(original_overrides,
-                                              **{"weak-csp": "Missing Security Headers"})
+                H.LAYER_FILES[layer].write_text(path.read_text())
+            # Heading-like lines inside either kind of fenced example are not corpus headings.
+            examples = ("\n```markdown\n### Not a corpus heading\n## Not a category\n```\n"
+                        "~~~markdown\n### Pattern: Not a real pattern\n~~~\n")
+            H.LAYER_FILES["infra"].write_text(full_text.replace(marker, examples + marker))
+            H.validate_pattern_sections()
+            H.LAYER_FILES["nextjs"].unlink()
+            H.LAYER_FILES["infra"].write_text(full_text + "\n### Pattern: Orphan test\nBody\n"
+                                             "### Broken heading\nBody\n")
+            H.PATTERN_SECTION_OVERRIDES = dict(original_overrides, **{
+                "weak-csp": "Missing Security Headers", "unknown-pattern": "Unknown",
+                "missing-auth": H.PATTERNS["missing-auth"]["name"],
+            })
             try:
                 H.validate_pattern_sections()
             except ValueError as exc:
@@ -93,11 +115,56 @@ def check_pattern_sections():
                 assert "Cannot read layer file" in report
                 assert "Orphan test" in report and "Weak Content-Security-Policy" in report
                 assert "claimed by" in report
+                assert "Unknown override key 'unknown-pattern'" in report
+                assert "Redundant override for 'missing-auth'" in report
+                assert "Malformed corpus heading '### Broken heading'" in report
             else:
                 raise AssertionError("broken corpus must fail startup validation")
     finally:
         H.LAYER_FILES = original_files
         H.PATTERN_SECTION_OVERRIDES = original_overrides
+
+
+def check_pattern_prompts():
+    """Exercise both production call sites without launching agents or writing results."""
+    ids = ["secrets-in-source", "etl-sql-assembly"]
+    captured = []
+
+    def capture_batch(items, batch_size):
+        captured.extend(items)
+        return [{"pattern_id": item["pattern_id"], "success": True, "output": "[]"}
+                for item in items]
+
+    recon = "## Notable Security-Relevant Findings\nTest clues\n"
+    with tempfile.TemporaryDirectory() as tmp, patch.object(H, "RESULTS_DIR", Path(tmp)), \
+            patch.object(H, "run_batch", capture_batch), \
+            patch.object(H, "_map_recon_to_patterns", return_value=dict.fromkeys(ids, "Test clue")):
+        hunt = H.stage_hunt(tmp, recon, patterns=ids)
+        H.stage_gapfill(tmp, recon, hunt)
+        assert len(captured) == 2 * len(ids)
+        for item in captured:
+            pid = item["pattern_id"]
+            full_text = H.LAYER_FILES[H.PATTERNS[pid]["layer"]].read_text()
+            section = H.extract_pattern_section(full_text, pid)
+            prompt = item["prompt"]
+            assert section in prompt, pid
+            assert H.PATTERN_SECTION_RE.findall(prompt) == [H.resolve_pattern_heading(pid)], pid
+            preamble = full_text[:full_text.index("### Pattern: ")].strip()
+            assert preamble not in prompt, pid
+            assert "## Quick Detection Commands" not in prompt, pid
+
+        # Missing knowledge is a read error, never degraded-but-continuing coverage.
+        missing = dict(H.LAYER_FILES, infra=Path(tmp) / "missing.md")
+        for stage in (lambda: H.stage_hunt(tmp, recon, patterns=ids),
+                      lambda: H.stage_gapfill(tmp, recon, hunt)):
+            with patch.object(H, "LAYER_FILES", missing):
+                try:
+                    stage()
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise AssertionError("missing layer must fail before run_batch")
+        assert len(captured) == 2 * len(ids)
 
 
 def check_ids():
@@ -422,7 +489,7 @@ def replay(hunt_path, log_path):
 
 
 def main():
-    for check in (check_pattern_sections, check_ids, check_dedupe, check_dedupe_template_exemptions,
+    for check in (check_pattern_sections, check_pattern_prompts, check_ids, check_dedupe, check_dedupe_template_exemptions,
                   check_primary_prefers_adjudicated,
                   check_reconcile, check_report_paths, check_config_refs,
                   check_template_cap, check_offline_rebuild):

@@ -400,10 +400,7 @@ def stage_hunt(repo_path: str, recon_doc: str, patterns: list[str] = None,
         layer = pinfo["layer"]
         if layer not in layer_knowledge_cache:
             layer_file = LAYER_FILES[layer]
-            if not layer_file.exists():
-                print(f"  ⚠ WARNING: Knowledge file missing: {layer_file}")
-                print(f"             Agents will hunt {layer} patterns without specialized context.")
-            layer_knowledge_cache[layer] = layer_file.read_text() if layer_file.exists() else ""
+            layer_knowledge_cache[layer] = layer_file.read_text()
     
     # Build hunt items
     hunt_items = []
@@ -549,9 +546,7 @@ def stage_gapfill(repo_path: str, recon_doc: str, hunt_results: list[dict],
         layer = pinfo["layer"]
         if layer not in layer_knowledge_cache:
             layer_file = LAYER_FILES[layer]
-            if not layer_file.exists():
-                print(f"  ⚠ WARNING: Knowledge file missing: {layer_file}")
-            layer_knowledge_cache[layer] = layer_file.read_text() if layer_file.exists() else ""
+            layer_knowledge_cache[layer] = layer_file.read_text()
         
         full_layer = layer_knowledge_cache.get(layer, "")
         pattern_section = extract_pattern_section(full_layer, pid)
@@ -1464,6 +1459,24 @@ def run_batch(items: list[dict], batch_size: int = BATCH_SIZE,
 # ── Utility Functions ─────────────────────────────────────────────────────────
 
 PATTERN_SECTION_RE = re.compile(r"^### Pattern: ([^\r\n]+)\r?$", re.MULTILINE)
+SECTION_BOUNDARY_RE = re.compile(r"^(?:### Pattern: |## )[^\r\n]*\r?$", re.MULTILINE)
+
+
+def _outside_code_fences(full_text: str) -> str:
+    """Mask fenced examples, preserving offsets for slicing the original text."""
+    lines = []
+    fence = None
+    for line in full_text.splitlines(keepends=True):
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\r\n"))
+        if fence is None and marker:
+            fence = marker.group(1)
+        elif (fence and marker and marker.group(1)[0] == fence[0]
+              and len(marker.group(1)) >= len(fence) and not marker.group(2).strip()):
+            fence = None
+            lines.append(re.sub(r"[^\r\n]", " ", line))
+            continue
+        lines.append(re.sub(r"[^\r\n]", " ", line) if fence else line)
+    return "".join(lines)
 
 
 def resolve_pattern_heading(pid: str) -> str:
@@ -1475,7 +1488,8 @@ def extract_pattern_section(full_text: str, pid: str) -> str:
     """Extract exactly one section by registry id; never substitute layer context."""
     heading = resolve_pattern_heading(pid)
     layer_file = LAYER_FILES[PATTERNS[pid]["layer"]]
-    headings = list(PATTERN_SECTION_RE.finditer(full_text))
+    structure = _outside_code_fences(full_text)
+    headings = list(PATTERN_SECTION_RE.finditer(structure))
     matches = [i for i, match in enumerate(headings) if match.group(1) == heading]
     problem = f"Pattern '{pid}', expected heading '### Pattern: {heading}' in {layer_file}"
     if len(matches) != 1:
@@ -1483,16 +1497,26 @@ def extract_pattern_section(full_text: str, pid: str) -> str:
 
     index = matches[0]
     start = headings[index]
-    end = headings[index + 1].start() if index + 1 < len(headings) else len(full_text)
+    boundary = SECTION_BOUNDARY_RE.search(structure, start.end())
+    end = boundary.start() if boundary else len(full_text)
+    # A separator belongs to the following category/pattern, not this section.
+    separator = re.search(r"(?m)^---[ \t]*\r?\n(?:[ \t]*\r?\n)*\Z", structure[:end])
+    if separator and boundary:
+        end = separator.start()
     section = full_text[start.start():end]
-    if not full_text[start.end():end].strip() or len(section) >= len(full_text):
-        raise ValueError(f"{problem}: section is empty or is the full layer file")
+    if not full_text[start.end():end].strip() or (len(headings) == 1 and not boundary):
+        raise ValueError(f"{problem}: section is empty or is the full layer body")
     return section
 
 
 def validate_pattern_sections() -> None:
     """Require a bijection between registry ids and non-empty corpus sections."""
     problems = []
+    for pid in sorted(set(PATTERN_SECTION_OVERRIDES) - set(PATTERNS)):
+        problems.append(f"Unknown override key '{pid}'")
+    for pid, heading in PATTERN_SECTION_OVERRIDES.items():
+        if pid in PATTERNS and heading == PATTERNS[pid]["name"]:
+            problems.append(f"Redundant override for '{pid}': '{heading}'")
     layers = {}
     claims = {}
     for layer, layer_file in LAYER_FILES.items():
@@ -1517,9 +1541,13 @@ def validate_pattern_sections() -> None:
         if len(pids) > 1:
             problems.append(f"Heading '{heading}' in layer '{layer}' claimed by {pids}")
     for layer, full_text in layers.items():
-        for match in PATTERN_SECTION_RE.finditer(full_text):
-            if (layer, match.group(1)) not in claims:
-                problems.append(f"Orphan heading '{match.group(1)}' in {LAYER_FILES[layer]}")
+        structure = _outside_code_fences(full_text)
+        for match in re.finditer(r"^###\s+[^\r\n]*", structure, re.MULTILINE):
+            heading = PATTERN_SECTION_RE.fullmatch(match.group())
+            if heading is None:
+                problems.append(f"Malformed corpus heading '{match.group()}' in {LAYER_FILES[layer]}")
+            elif (layer, heading.group(1)) not in claims:
+                problems.append(f"Orphan heading '{heading.group(1)}' in {LAYER_FILES[layer]}")
 
     if problems:
         raise ValueError("Pattern section validation failed:\n" + "\n".join(problems))
