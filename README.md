@@ -296,6 +296,7 @@ as a complete assessment. Dependency intel is rendered from the saved live brief
 Offline regression checks: `python3 test_funnel.py` (stdlib assertions, no LLM calls).
 
 `vulnerability_context.py` also accepts `--no-cve-now` alongside `--no-osv`,
+`--no-nvd`, `--no-github`, `--no-kev`, `--no-npm`.
 
 ## Project Structure
 
